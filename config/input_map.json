@@ -1,0 +1,17 @@
+{
+  "A": ["Enter", "KeyA"],
+  "B": ["Escape", "Backspace", "KeyB"],
+  "X": ["KeyX"],
+  "Y": ["Slash", "KeyY"],
+  "UP": ["ArrowUp"],
+  "DOWN": ["ArrowDown"],
+  "LEFT": ["ArrowLeft"],
+  "RIGHT": ["ArrowRight"],
+  "LB": ["BracketLeft"],
+  "RB": ["BracketRight"],
+  "LT": ["Minus"],
+  "RT": ["Equal"],
+  "MENU": ["KeyM", "Tab"],
+  "VIEW": ["KeyV", "F1"],
+  "NEXUS": ["KeyN"]
+} 

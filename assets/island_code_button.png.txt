@@ -1,0 +1,2 @@
+Please replace this file with a screenshot of the button that opens the screen for entering an island code. This might be labeled "Island Code" or "Enter Code".
+Save it as 'island_code_button.png'. 

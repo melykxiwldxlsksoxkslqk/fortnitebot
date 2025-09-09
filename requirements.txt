@@ -1,0 +1,17 @@
+playwright
+pyautogui
+opencv-python
+gymnasium
+stable-baselines3[extra]
+torch
+customtkinter
+CTkMessagebox
+pyperclip
+numpy
+ultralytics
+pywebview
+# ADDED: More robust input libraries and faster screen capture
+pydirectinput
+vgamepad
+mss
+pygetwindow

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+env/
+*.log
+
+# Editors/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Node/Electron
+node_modules/
+desktop/node_modules/
+third_party/**/node_modules/
+*.asar
+
+# Builds/Artifacts
+build/
+dist/
+*.bak
+*.tmp
+
+# Browser/Drivers/Cache
+chrome-profile/
+chromedriver-win64/
+debug/
+
+# Large third-party sources (kept locally)
+opencv/
+
+# Misc
+*.sqlite*
+*.db 

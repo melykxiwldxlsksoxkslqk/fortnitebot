@@ -1,0 +1,2 @@
+Please replace this file with a screenshot of the "Launch" or "Accept" button that appears after you have entered an island code.
+Save it as 'launch_island_button.png'. 

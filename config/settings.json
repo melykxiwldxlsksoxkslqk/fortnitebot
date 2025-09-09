@@ -1,0 +1,14 @@
+{
+    "accounts": [
+        {
+            "login": "kow111k333@gmail.com",
+            "password": "zxcqwe123"
+        }
+    ],
+    "island_code": "7048-8422-2298",
+    "time_on_island_min": 59,
+    "headless": true,
+    "proxies": [],
+    "appearance": "Dark",
+    "theme": "dark-blue"
+}

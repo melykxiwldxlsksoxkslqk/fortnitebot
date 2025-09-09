@@ -1,0 +1,2 @@
+Please replace this file with a screenshot of the button that leads to the game mode selection, for example, a "Creative" or "Change Mode" button in the main menu.
+Save it as 'creative_mode_button.png'. 

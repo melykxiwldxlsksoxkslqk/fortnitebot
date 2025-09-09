@@ -1,0 +1,2 @@
+Please replace this file with a screenshot of the input field where the island code is typed. Make the screenshot tight around the text box.
+Save it as 'island_code_input_field.png'. 
