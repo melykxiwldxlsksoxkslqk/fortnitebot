@@ -10,13 +10,11 @@ env/
 *.log
 
 # Editors/OS
-.vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
 # Node/Electron
-node_modules/
 desktop/node_modules/
 third_party/**/node_modules/
 *.asar
@@ -28,9 +26,7 @@ dist/
 *.tmp
 
 # Browser/Drivers/Cache
-chrome-profile/
-chromedriver-win64/
-debug/
+
 
 
 # Misc
