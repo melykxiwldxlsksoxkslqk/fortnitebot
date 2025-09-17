@@ -14,6 +14,28 @@ _SETTINGS: Dict[str, object] = {}
 _STATUS: Dict[str, Dict[str, object]] = {}
 
 
+def _to_bool(val, default=False) -> bool:
+    try:
+        if isinstance(val, bool):
+            return val
+        s = str(val).strip().lower()
+        if s in ("1", "true", "yes", "on"): return True
+        if s in ("0", "false", "no", "off", ""): return False
+        return bool(int(val))
+    except Exception:
+        return bool(default)
+
+
+def _to_int(val, default=0) -> int:
+    try:
+        return int(val)
+    except Exception:
+        try:
+            return int(float(val))
+        except Exception:
+            return int(default)
+
+
 def _load_settings():
     global _SETTINGS
     try:
@@ -21,12 +43,12 @@ def _load_settings():
         s = dbmod.get_settings()
         _SETTINGS = {
             "island_code": s.get('island_code', ""),
-            "time_on_island_min": int(s.get('time_on_island_min') or 15),
-            "headless": bool(int(s.get('headless', 1))),
+            "time_on_island_min": _to_int(s.get('time_on_island_min', 15), 15),
+            "headless": _to_bool(s.get('headless', 1), True),
             "appearance": s.get('appearance', "Dark"),
             "theme": s.get('theme', "blue"),
             "ingame_mode": s.get('ingame_mode', "passive"),
-            "invert_bg": bool(int(s.get('invert_bg', 0))) if isinstance(s.get('invert_bg', 0), (int, str)) else bool(s.get('invert_bg', False)),
+            "invert_bg": _to_bool(s.get('invert_bg', 0), False),
         }
     except Exception:
         _SETTINGS = {
@@ -121,14 +143,22 @@ def start_all():
     def start_one(acc, px):
         login = (acc.get('login') or '').strip().lower()
         old = _THREADS.get(login)
+        # Если уже запущен поток для этого аккаунта — не перезапускаем
         if old and old.is_alive():
             try:
-                for b in list(_BOTS):
-                    if (b.account or {}).get('login', '').strip().lower() == login:
-                        b.request_stop()
-                old.join(timeout=10)
+                _status_sys(login, "Уже запущен — пропускаю повторный старт")
             except Exception:
                 pass
+            return
+        # Если раньше был поток, но он завершился — почистим и запустим заново
+        try:
+            for b in list(_BOTS):
+                if (b.account or {}).get('login', '').strip().lower() == login:
+                    b.request_stop()
+            if old and old.is_alive():
+                old.join(timeout=10)
+        except Exception:
+            pass
         bot = BotLogic(acc, px, _SETTINGS, _update_status)
         _BOTS.append(bot)
         # Лог старта конкретного бота
@@ -207,12 +237,12 @@ def save_settings(payload: dict):
     s = _SETTINGS.copy()
     s.update({
         'island_code': payload.get('island_code', s['island_code']),
-        'time_on_island_min': int(payload.get('time_on_island_min', s['time_on_island_min'] or 15)),
-        'headless': int(bool(payload.get('headless', s['headless']))),
+        'time_on_island_min': _to_int(payload.get('time_on_island_min', s['time_on_island_min'] or 15), s['time_on_island_min'] or 15),
+        'headless': 1 if _to_bool(payload.get('headless', s['headless'])) else 0,
         'appearance': payload.get('appearance', s['appearance']),
         'theme': payload.get('theme', s['theme']),
         'ingame_mode': str(payload.get('ingame_mode', s['ingame_mode'])).strip().lower(),
-        'invert_bg': int(bool(payload.get('invert_bg', s.get('invert_bg', False)))),
+        'invert_bg': 1 if _to_bool(payload.get('invert_bg', s.get('invert_bg', False))) else 0,
     })
     try:
         dbmod.set_settings(s)

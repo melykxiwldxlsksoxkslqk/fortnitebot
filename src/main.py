@@ -39,11 +39,37 @@ class BrowserClosedError(Exception):
 	pass
 
 def load_settings():
-	"""Читает настройки из БД."""
+	"""Читает настройки из БД и нормализует типы."""
 	try:
 		dbmod.init_db()
-		s = dbmod.get_settings()
-		return s or {}
+		s = dbmod.get_settings() or {}
+		# Нормализация типов (в БД всё хранится строками)
+		norm: Dict[str, object] = {}
+		for k, v in s.items():
+			vk = str(k)
+			vv = v
+			if vk in ("time_on_island_min",):
+				try:
+					vv = int(v)
+				except Exception:
+					vv = 15
+			elif vk in ("headless", "invert_bg"):
+				# поддерживаем '0'/'1', 0/1, True/False, 'true'/'false'
+				try:
+					if isinstance(v, bool):
+						vv = v
+					else:
+						vs = str(v).strip().lower()
+						if vs in ("1", "true", "yes", "on"):
+							vv = True
+						elif vs in ("0", "false", "no", "off"):
+							vv = False
+						else:
+							vv = bool(int(v))
+				except Exception:
+					vv = False if vk == "headless" else False
+			norm[vk] = vv
+		return norm
 	except Exception:
 		return {}
 
@@ -64,7 +90,7 @@ def load_island_code():
 	except Exception:
 		return "1234-5678-9012"
 
-def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event=None):
+def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event=None, status_cb=None):
 	"""
 	Main function to run the bot for a single account.
 	"""
@@ -78,6 +104,13 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 		print("!!! Microsoft account email and password.                   !!!")
 		print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 		return False
+
+	def _emit_status(text: str):
+		try:
+			if status_cb:
+				status_cb(str(text))
+		except Exception:
+			pass
 
 	def verify_required_assets():
 		required = [
@@ -147,10 +180,17 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 			pass
 
 	print(f"Starting bot for account: {account_login}")
+	_emit_status("Запуск бота")
 	with sync_playwright() as p:
 		# Нормализуем и фиксируем код острова (из аргумента или из БД)
 		island_code = (island_code or load_island_code() or "").strip()
 		print(f"USING ISLAND CODE: '{island_code}'")
+		_emit_status(f"Код острова: {island_code}")
+		# Включим глобальный debug для Vision (снимки матчей/шагов)
+		try:
+			vision.set_global_debug(True)
+		except Exception:
+			pass
 		result_success = False
 		# Гарантия: один аккаунт → один браузер. Закрываем старый, если он ещё жив.
 		try:
@@ -250,6 +290,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 			return b, c, c.new_page()
 
 		browser, context, page = open_browser(headless, proxy)
+		_emit_status(f"Режим браузера: {'headless' if headless else 'visible'}")
 		# Сохраняем текущий браузер как активный для аккаунта
 		try:
 			with _ACTIVE_BROWSERS_LOCK:
@@ -259,22 +300,32 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 
 		try:
 			print("Navigating to Xbox Cloud Gaming...")
-			page.goto("https://www.xbox.com/play", wait_until="load")
+			_emit_status("Переход к Xbox Cloud Gaming...")
+			try:
+				page.goto("https://www.xbox.com/play", wait_until="load")
+			except Exception:
+				# Повтор при ERR_ABORTED/закрытии контекста во время навигации
+				time.sleep(1)
+				page = context.new_page()
+				page.goto("https://www.xbox.com/play", wait_until="domcontentloaded")
 			time.sleep(3)
 			take_debug_screenshot(page, "initial_page")
 
 			# Handle cookie consent banner
 			try:
 				print("Checking for cookie consent banner...")
+				_emit_status("Проверка баннера cookies...")
 				accept_button = page.locator('button:has-text("Accept"), button:has-text("Přijmout")').first
 				accept_button.wait_for(timeout=7000)
 				if accept_button.is_visible():
 					print("Cookie consent banner found. Clicking it.")
+					_emit_status("Закрываю баннер cookies")
 					accept_button.click()
 					page.wait_for_timeout(2000)
 					take_debug_screenshot(page, "after_cookie_accept")
 			except Exception:
 				print("Cookie consent banner not found or already handled, skipping.")
+				_emit_status("Баннер cookies не найден/уже закрыт")
 
 			# Helper: optionally dismiss Microsoft Account Checkup prompt if it appears
 			def handle_optional_account_checkup(p) -> bool:
@@ -347,6 +398,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 				email_field.fill(login)
 				page.locator('#idSIButton9, input[type="submit"], button:has-text("Next"), button:has-text("Далее")').first.click()
 				print("Email submitted.")
+				_emit_status("Почта отправлена")
 				page.wait_for_load_state('domcontentloaded', timeout=15000)
 				take_debug_screenshot(page, "after_email_submit")
  
@@ -395,6 +447,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 					switched = switch_to_password_mode(page)
 					if switched:
 						print("Switched to password login mode.")
+						_emit_status("Перешёл на ввод пароля")
 				except Exception:
 					pass
 
@@ -518,12 +571,12 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 				if not submit_password(page, frame_ctx, password_field):
 					raise PWTimeoutError("Unable to submit password: no submit control and Enter fallback failed")
 				print("Password submitted.")
+				_emit_status("Пароль отправлен")
 				take_debug_screenshot(page, "after_password_submit")
 
 				# 2a) Проверка ошибки неправильного пароля на login.live.com (многоязычно)
-				def _has_bad_password_error() -> bool:
-					selectors = '#passwordError, #usernameError, div[role="alert"], .error.pageLevel, .alert, .error'
-					time.sleep(1)
+				def _has_bad_password_error_once() -> bool:
+					selectors = '#passwordError, #usernameError, #idTd_Error, div[role="alert"], .error.pageLevel, .alert, .error'
 					texts_all = []
 					try:
 						texts_all.extend(page.locator(selectors).all_inner_texts())
@@ -544,8 +597,19 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 					]
 					return any(re.search(p, full_text, re.IGNORECASE) for p in patterns)
 
-				if _has_bad_password_error():
-					raise BadCredentialsError("Неверный логин или пароль")
+				# Подождём появления сообщения об ошибке (до 15 секунд), т.к. оно появляется с задержкой
+				deadline = time.time() + 15
+				while time.time() < deadline:
+					try:
+						if _has_bad_password_error_once():
+							take_debug_screenshot(page, "password_incorrect")
+							_emit_status("Ошибка: неверный логин/пароль")
+							raise BadCredentialsError("Неверный логин или пароль")
+					except BadCredentialsError:
+						raise
+					except Exception:
+						pass
+					time.sleep(0.5)
 				
 				# 3) Stay signed in?
 				def handle_kmsi(p) -> bool:
@@ -679,6 +743,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 			logged_in = try_login_flow(page)
 			if not logged_in and headless:
 				print("Login failed in headless mode. Retrying with visible browser...")
+				_emit_status("Не удалось войти в скрытом режиме — пробую с окном")
 				try:
 					browser.close()
 				except Exception:
@@ -686,15 +751,18 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 				browser, context, page = open_browser(False, proxy)
 				logged_in = try_login_flow(page)
 				if not logged_in:
+					_emit_status("Ошибка входа в обоих режимах")
 					raise PWTimeoutError("Login failed in both headless and headful modes")
 
 			# --- FINAL: Direct navigation to the game page ---
 			if not logged_in:
 				print("Login was not successful; aborting navigation to game page.")
+				_emit_status("Вход не выполнен — прерываю навигацию к игре")
 				return False
 			fortnite_url = "https://www.xbox.com/en-US/play/games/fortnite/BT5P2X999VH2"
 			launch_url = "https://www.xbox.com/en-US/play/launch/fortnite/BT5P2X999VH2"
 			print(f"Credentials accepted. Navigating to Fortnite page: {fortnite_url}")
+			_emit_status("Вход выполнен, открываю страницу Fortnite")
 
 			# На всякий случай перед переходом закроем необязательное окно checkup, если мы на домене account.microsoft.com
 			try:
@@ -1543,11 +1611,13 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 			def search_and_launch_island_unified(p, code: str) -> bool:
 				"""Сначала пробуем DOM-поиск (лупа → поле → submit → SELECT → PLAY), если не удалось — канвас-метод."""
 				print("[DOM] Try island search via page DOM")
+				_emit_status("Поиск острова (DOM)")
 				# Страховка: не начинать поиск, пока висит CONNECTING/LOGGING
 				start_block = time.time()
 				while time.time() - start_block < 5:
 					try:
 						if vision.detect_connecting_overlay_on_page(p):
+							_emit_status("Жду окончания загрузки...")
 							p.wait_for_timeout(600)
 							continue
 						break
@@ -1555,18 +1625,21 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 						break
 				try:
 					# Открыть поиск по DOM
+					_emit_status("Открываю поиск")
 					trigger = p.locator('button[aria-label*="Search"], button:has-text("Search"), [role="button"]:has([data-icon="search"])').first
 					if trigger and trigger.is_visible():
 						trigger.click()
 						p.wait_for_timeout(300)
 						take_debug_screenshot(p, "dom_opened_search")
 					# Ввести код в поле с плейсхолдером
+					_emit_status("Ввожу код")
 					inp = p.get_by_placeholder(re.compile(r"Search.*Islands|Search.*Creators|Search", re.I)).first
 					if inp and inp.is_visible():
 						inp.fill("")
 						inp.type(code, delay=50)
 						take_debug_screenshot(p, "dom_typed_code")
 						# Нажать Submit, если есть, иначе Enter
+						_emit_status("Подтверждаю поиск")
 						sub = p.locator('button:has-text("SUBMIT")').first
 						if sub and sub.is_visible():
 							sub.click()
@@ -1578,44 +1651,57 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 							take_debug_screenshot(p, "dom_pressed_enter_submit")
 						p.wait_for_timeout(800)
 						# Перейти на страницу первой карты или сразу нажать SELECT
+						_emit_status("Выбираю первую карту из результатов")
 						first_card = p.locator('a[href*="/play/launch/"]').first
 						if first_card and first_card.is_visible():
 							first_card.click()
 							p.wait_for_timeout(800)
 							take_debug_screenshot(p, "dom_clicked_first_card")
 						# SELECT на странице карты
+						_emit_status("Нажимаю 'Выбрать'")
 						sel = p.locator('button:has-text("SELECT"), button:has-text("Выбрать")').first
 						if sel and sel.is_visible():
 							sel.click()
 							p.wait_for_timeout(800)
 							take_debug_screenshot(p, "dom_clicked_select")
 						# PLAY в лобби
+						_emit_status("Нажимаю 'PLAY' в лобби")
 						play = p.locator('button:has-text("PLAY"), button:has-text("Играть")').first
 						if play and play.is_visible():
 							play.click()
 							p.wait_for_timeout(1000)
 							take_debug_screenshot(p, "dom_clicked_play")
 						print("[DOM] Island selected and Play pressed")
+						_emit_status("Карта выбрана, игра запускается")
 						return True
 					print("[DOM] Input not visible — fallback to canvas")
+					_emit_status("Не нашел поле ввода, пробую через канвас")
 				except Exception as e:
 					print(f"[DOM] Failed with {e}, fallback to canvas")
+					_emit_status("Ошибка DOM-поиска, пробую через канвас")
 				# Канвас‑резерв
 				return search_and_launch_island_canvas(p, code)
 
 			def do_active_ingame_actions(p, minutes: int):
 				duration = max(1, int(minutes)) * 60
 				start = time.time()
+				_emit_status(f"Активные действия в игре ({minutes} мин.)")
 				vp = p.viewport_size or {"width": 1280, "height": 720}
 				cx = int(vp["width"]) // 2
 				cy = int(vp["height"]) // 2
+				last_report = 0.0
 				def heuristic_action_step():
+					nonlocal last_report
 					try:
+						if time.time() - last_report > 20:
+							_emit_status("Выполняю игровое действие...")
+							last_report = time.time()
 						frame = vision.capture_obs_frame()
 						has_target = vision.detect_enemy_health_bar(frame)
 						center_b = vision.center_brightness(frame)
 						# Коррекция ориентации, если смотрим в пол/небо
 						if center_b > 210 or center_b < 40:
+							_emit_status("Корректирую ориентацию")
 							p.mouse.move(cx, cy)
 							p.mouse.down(button='right')
 							p.mouse.move(cx, cy + (-140 if center_b > 210 else 140), steps=10)
@@ -1623,6 +1709,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 						# Тактика
 						if has_target:
 							# Прицелиться и атаковать
+							_emit_status("Вижу цель, атакую")
 							p.mouse.move(cx, cy)
 							p.mouse.down(button='right')
 							p.mouse.move(cx + random.randint(-160, 160), cy, steps=10)
@@ -1637,6 +1724,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 								p.keyboard.press('1')
 						else:
 							# Поиск цели: TAB, разворот, шаг в сторону
+							_emit_status("Ищу цель")
 							if random.random() < 0.5:
 								p.keyboard.press('tab')
 							p.mouse.move(cx, cy)
@@ -1652,6 +1740,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 				while time.time() - start < duration:
 					heuristic_action_step()
 					p.wait_for_timeout(random.randint(700, 1400))
+				_emit_status("Завершил активные действия")
 
 			# --- Helpers for island navigation via DOM ---
 			def skip_trailer_if_present(p):
@@ -1897,8 +1986,10 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 					# Фокус на канвасе
 					stream_input.ensure_stream_focus(p)
 					print("[SCREEN] Step 1: Click search icon (page CV)")
+					_emit_status("Открываю поиск острова")
 					if not stream_input.open_search(p):
 						print("[FALLBACK] Press Slash to open search")
+						_emit_status("Поиск не открылся — пробую слеш /")
 						try:
 							p.keyboard.press('/')
 							p.wait_for_timeout(120)
@@ -1914,18 +2005,22 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 						)
 						if not ipt:
 							print("[SCREEN] Error: search panel did not open after click")
+							_emit_status("Ошибка: панель поиска не открылась")
 							return False
 
 					print("[SCREEN] Step 2: Focus input and type code")
+					_emit_status("Ввожу код острова")
 					try:
 						p.mouse.move(ipt[0], ipt[1])
 						p.mouse.click(ipt[0], ipt[1])
 						p.keyboard.type(code, delay=50)
 						p.keyboard.press('Enter')
 					except Exception:
+						_emit_status("Ошибка при вводе кода")
 						return False
 
 					print("[SCREEN] Step 3: Submit")
+					_emit_status("Подтверждаю запуск острова")
 					if not vision.click_on_image_on_page(p, 'assets/submit_button.png', confidence=0.75, timeout=3, roi=(0.18, 0.40, 0.82, 0.92), scales=[0.7, 1.0, 1.2]):
 						try:
 							p.keyboard.press('Enter')
@@ -1933,10 +2028,12 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 							pass
 
 					print("[SCREEN] Step 4: Wait for PLAY")
+					_emit_status("Жду кнопку PLAY")
 					btn = vision.find_image_on_page(p, 'assets/play_button_yellow.png', confidence=0.70, timeout=10, roi=None, scales=[0.75, 0.9, 1.0, 1.2])
 					if btn:
 						try:
 							p.mouse.click(btn[0], btn[1])
+							_emit_status("Нажимаю PLAY (жёлтая)")
 							return True
 						except Exception:
 							pass
@@ -1944,39 +2041,48 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 					if btn2:
 						try:
 							p.mouse.click(btn2[0], btn2[1])
+							_emit_status("Нажимаю PLAY")
 							return True
 						except Exception:
 							pass
 					try:
 						p.keyboard.press('Enter')
 						print("[SCREEN] Fallback: Enter for PLAY")
+						_emit_status("Нажимаю Enter вместо PLAY")
 						return True
 					except Exception:
+						_emit_status("Не получилось нажать PLAY")
 						return False
 				except Exception as e:
 					print(f"[SCREEN] Unexpected error: {e}")
+					_emit_status("Ошибка экрана запуска острова")
 					return False
 
 			# ... existing code ...
 			# --- Ручной контроль: не переходить к шагу 12 без вашей команды ---
 			if manual_lobby_event is not None:
 				print("[WAIT] Жду команду 'Лобби готово' перед шагом 12...")
+				_emit_status("Ожидание ручной команды 'Лобби готово'")
 				try:
 					# Ждём до 10 минут, чтобы не висеть бесконечно
 					manual_lobby_event.wait(timeout=600)
 					if manual_lobby_event.is_set():
 						print("[WAIT] Команда получена — продолжаю к шагу 12.")
+						_emit_status("Команда 'Лобби готово' получена")
 						try:
 							manual_lobby_event.clear()
 						except Exception:
 							pass
 					else:
 						print("[WAIT] Таймаут ожидания команды — продолжаю по таймауту.")
+						_emit_status("Таймаут ожидания ручной команды")
 				except Exception:
 					pass
 
-			if not screen_open_search_and_enter_code(page, island_code):
-				# Используем только геймпад‑режим из stream_input (без переимпорта)
+			# --- NEW: Use the robust, unified island search flow ---
+			if not search_and_launch_island_unified(page, island_code):
+				_emit_status("Не удалось запустить остров")
+				# Fallback to the old gamepad-style search as a last resort
 				stream_input.open_search(page)
 
 		except BadCredentialsError as e:
@@ -2032,6 +2138,13 @@ def main():
 	island_code = settings.get('island_code') or load_island_code()
 	headless = settings.get('headless', True)
 
+	# --- Guard: require island code ---
+	code_clean = (island_code or "").strip()
+	placeholder_codes = {"", "1234-5678-9012", "0000-0000-0000"}
+	if not code_clean or code_clean in placeholder_codes:
+		print("Код острова не установлен. Боты не будут запущены.")
+		return
+
 	# Запрет системного ввода (мышь/клава ОС) — используем только виртуальный ввод страницы
 	try:
 		vision.set_disable_os_input(True)
@@ -2039,7 +2152,7 @@ def main():
 		pass
 
 	for account in accounts:
-		run_bot(account, island_code, headless=headless)
+		run_bot(account, code_clean, headless=headless)
 
 if __name__ == "__main__":
 	main() 

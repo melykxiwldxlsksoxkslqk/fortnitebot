@@ -66,7 +66,10 @@ class BotLogic:
 
             # Запуск синхронной функции в отдельном потоке, чтобы не блокировать event loop
             try:
-                success = await asyncio.to_thread(run_bot, self.account, island_code, headless, self.proxy, self.manual_lobby_event)
+                def _forward(msg: str):
+                    if self.update_status:
+                        self.update_status(self.account.get('login', 'unknown'), msg)
+                success = await asyncio.to_thread(run_bot, self.account, island_code, headless, self.proxy, self.manual_lobby_event, _forward)
             except BadCredentialsError:
                 if self.update_status:
                     self.update_status(self.account.get('login', 'unknown'), "Неверный логин/пароль")

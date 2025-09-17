@@ -1358,14 +1358,37 @@ def navigate_and_select_image(
     last_focused_pos = (-1, -1)
     stuck_counter = 0
 
+    # Try to start a visual tracker on the focused highlight once we first see it
+    tracker_started = False
+
     while time.time() - start_time < timeout:
         # Ищем текущий выделенный элемент
         focused_rect = _seek(focused_template_path, 0.5, True, "nav_focus")
 
         if focused_rect:
+            # Start/refresh tracker on the focused highlight
+            if not tracker_started:
+                frame_now = _get_current_frame(page)
+                if _FOCUS_TRACKER.start(frame_now, focused_rect):
+                    tracker_started = True
             focused_cx = focused_rect[0] + focused_rect[2] // 2
             focused_cy = focused_rect[1] + focused_rect[3] // 2
+        else:
+            # If we have a tracker, attempt to recover focus position by tracking
+            if tracker_started:
+                frame_now = _get_current_frame(page)
+                tr_rect = _FOCUS_TRACKER.update(frame_now)
+                if tr_rect is not None:
+                    focused_cx = tr_rect[0] + tr_rect[2] // 2
+                    focused_cy = tr_rect[1] + tr_rect[3] // 2
+                else:
+                    focused_cx = None
+                    focused_cy = None
+            else:
+                focused_cx = None
+                focused_cy = None
 
+        if focused_cx is not None and focused_cy is not None:
             # Проверяем, не застряли ли мы
             if focused_cx == last_focused_pos[0] and focused_cy == last_focused_pos[1]:
                 stuck_counter += 1
@@ -1387,6 +1410,7 @@ def navigate_and_select_image(
                 else:
                     press_key('enter')
                 time.sleep(1) # Пауза после выбора
+                _FOCUS_TRACKER.reset()
                 return True
 
             # Логика навигации (очень простая: пробуем клавиши по очереди)
@@ -1398,7 +1422,7 @@ def navigate_and_select_image(
                 press_key(key_to_press)
 
         else:
-            # Если фокус вообще не найден, нажимаем первую навигационную клавишу
+            # Если фокус не найден и трекер не помог — нажимаем первую навигационную клавишу
             print("[Navigate] Не найден выделенный элемент. Пробуем нажать первую клавишу...")
             if use_gamepad and init_gamepad():
                 gp_tap_dpad(navigation_keys[0])
@@ -1408,4 +1432,96 @@ def navigate_and_select_image(
         time.sleep(0.7) # Пауза между нажатиями
 
     print("[Navigate] Таймаут навигации.")
+    _FOCUS_TRACKER.reset()
     return False
+
+# --- Lightweight visual tracker (CSRT/KCF) for UI highlight locking ---
+try:
+    _HAS_LEGACY = hasattr(cv2, 'legacy') and hasattr(cv2.legacy, 'TrackerCSRT_create')
+except Exception:
+    _HAS_LEGACY = False
+
+
+def _create_cv_tracker():
+    try:
+        if _HAS_LEGACY and hasattr(cv2.legacy, 'TrackerCSRT_create'):
+            return cv2.legacy.TrackerCSRT_create()
+    except Exception:
+        pass
+    try:
+        if hasattr(cv2, 'TrackerCSRT_create'):
+            return cv2.TrackerCSRT_create()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        if _HAS_LEGACY and hasattr(cv2.legacy, 'TrackerKCF_create'):
+            return cv2.legacy.TrackerKCF_create()
+    except Exception:
+        pass
+    try:
+        if hasattr(cv2, 'TrackerKCF_create'):
+            return cv2.TrackerKCF_create()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return None
+
+
+class _FocusTracker:
+    def __init__(self) -> None:
+        self._tracker = None
+        self._last_rect = None  # x,y,w,h in frame coords
+        self._ok_streak = 0
+        self._fail_streak = 0
+
+    def reset(self) -> None:
+        self._tracker = None
+        self._last_rect = None
+        self._ok_streak = 0
+        self._fail_streak = 0
+
+    def start(self, frame_bgr, rect_xywh) -> bool:
+        tr = _create_cv_tracker()
+        if tr is None:
+            return False
+        try:
+            ok = tr.init(frame_bgr, tuple(map(float, rect_xywh)))
+            if not ok:
+                return False
+            self._tracker = tr
+            self._last_rect = tuple(rect_xywh)
+            self._ok_streak = 0
+            self._fail_streak = 0
+            return True
+        except Exception:
+            return False
+
+    def update(self, frame_bgr):
+        if self._tracker is None:
+            return None
+        try:
+            ok, box = self._tracker.update(frame_bgr)
+        except Exception:
+            ok = False
+            box = None
+        if ok and box is not None:
+            x, y, w, h = box
+            self._last_rect = (int(x), int(y), int(w), int(h))
+            self._ok_streak += 1
+            self._fail_streak = 0
+            return self._last_rect
+        else:
+            self._fail_streak += 1
+            if self._fail_streak >= 3:
+                # consider lost
+                self.reset()
+            return None
+
+
+_FOCUS_TRACKER = _FocusTracker()
+
+
+def _get_current_frame(page):
+    try:
+        return _capture_page_bgr(page) if page is not None else capture_screen()
+    except Exception:
+        return capture_screen()

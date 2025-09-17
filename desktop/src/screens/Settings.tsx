@@ -1,5 +1,5 @@
 import React from 'react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { Button, Group, Title, TextInput, NumberInput, Switch, Select } from '@mantine/core'
 
 declare global {
@@ -8,6 +8,8 @@ declare global {
 
 export default function Settings() {
   const [s, setS] = useState<any>({ island_code: '', time_on_island_min: 15, headless: true, ingame_mode: 'passive', invert_bg: false })
+  const initializedRef = useRef(false)
+  const debounceTimerRef = useRef<any>(null)
 
   const load = async () => {
     const st = await window.desktop.rpc('get_settings', null)
@@ -20,6 +22,21 @@ export default function Settings() {
     await window.desktop.rpc('save_settings', s)
     await load() // показать сохранённые значения сразу
   }
+
+  // Auto-save (debounced) on any change after initial load to ensure Start uses latest settings
+  useEffect(() => {
+    // Skip auto-save on very first state set from load()
+    if (!initializedRef.current) {
+      initializedRef.current = true
+      return
+    }
+    // Debounce saves to avoid spamming backend while user is typing
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current)
+    debounceTimerRef.current = setTimeout(async () => {
+      try { await window.desktop.rpc('save_settings', s) } catch {}
+    }, 400)
+    return () => { if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current) }
+  }, [s])
 
   return (
     <div>
