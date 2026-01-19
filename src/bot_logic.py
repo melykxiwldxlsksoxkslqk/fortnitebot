@@ -1,19 +1,81 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
-# pyautogui больше не используется напрямую в этом файле для навигации
-# import pyautogui
+"""
+Модуль бизнес-логики бота и RL-среды.
+
+Содержит:
+- BotLogic: класс для управления ботом из GUI
+- FortniteEnv: среда Gymnasium для обучения RL-агента
+"""
+
 import time
-from . import vision
-import cv2
-import asyncio
-from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError
 import os
 import threading
+import asyncio
+from typing import Optional, Callable, Dict, Any, Tuple
 
-# Этот класс используется графическим интерфейсом app.py
+import numpy as np
+import cv2
+
+# Опциональные импорты для RL
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+    GYM_AVAILABLE = True
+except ImportError:
+    gym = None
+    spaces = None
+    GYM_AVAILABLE = False
+
+# Импорт ввода (перенесён на уровень модуля для оптимизации)
+try:
+    import pydirectinput
+    DIRECT_INPUT_AVAILABLE = True
+except ImportError:
+    pydirectinput = None
+    DIRECT_INPUT_AVAILABLE = False
+
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+except ImportError:
+    pyautogui = None
+    PYAUTOGUI_AVAILABLE = False
+
+from . import vision
+
+try:
+    from .logger import get_logger
+    from .config import RL, VISION, TIMEOUTS
+except ImportError:
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    from src.logger import get_logger
+    from src.config import RL, VISION, TIMEOUTS
+
+logger = get_logger(__name__)
+
 class BotLogic:
-    def __init__(self, account, proxy, config, update_status_callback=None):
+    """
+    Класс управления ботом.
+    
+    Используется GUI для запуска, остановки и мониторинга бота.
+    """
+    
+    def __init__(
+        self,
+        account: Dict[str, str],
+        proxy: Optional[Dict[str, str]],
+        config: Dict[str, Any],
+        update_status_callback: Optional[Callable[[str, str], None]] = None
+    ):
+        """
+        Инициализация бота.
+        
+        Args:
+            account: Словарь с 'login' и 'password'
+            proxy: Опциональный словарь с настройками прокси
+            config: Конфигурация бота
+            update_status_callback: Колбэк для обновления статуса в UI
+        """
         self.account = account
         self.proxy = proxy
         self.config = config
@@ -22,21 +84,19 @@ class BotLogic:
         self.browser = None
         self.stop_requested = False
         self.manual_lobby_event = threading.Event()
-        # Для простоты, создадим экземпляр Vision прямо здесь
-        # self.vision = vision() # так как vision теперь модуль
-        # В идеале, vision тоже должен быть классом
+        
+        self._login = account.get('login', 'unknown')
+        logger.info(f"Создан бот для аккаунта: {self._login}")
 
-    def _log(self, message):
+    def _log(self, message: str) -> None:
         """Логирование с префиксом аккаунта + отправка статуса в UI."""
-        login = self.account.get('login', 'unknown')
         try:
             if self.update_status:
-                # Отправляем событие в UI
-                self.update_status(login, str(message))
-        except Exception:
-            pass
-        # Дублируем в stdout для обычных логов
-        print(f"[{login}] {message}")
+                self.update_status(self._login, str(message))
+        except Exception as e:
+            logger.debug(f"Ошибка отправки статуса: {e}")
+        
+        logger.info(f"[{self._login}] {message}")
 
     def signal_lobby_ready(self):
         """Устанавливает ручной флаг: лобби готово."""
@@ -98,264 +158,348 @@ class BotLogic:
 
 
 # --- Секция для ИИ-агента ---
-# Этот класс используется скриптом main.py для обучения
-v = vision # Используем модуль vision напрямую
+# Используем модуль vision напрямую
+v = vision
 
-class FortniteEnv(gym.Env):
+
+def _create_fortnite_env_class():
     """
-    Среда Gymnasium для обучения ИИ-агента в Fortnite.
+    Фабрика для создания класса FortniteEnv.
+    Позволяет отложить проверку gymnasium до момента использования.
     """
-    metadata = {'render.modes': ['human']}
-
-    def __init__(self, island_code):
-        super(FortniteEnv, self).__init__()
-
-        self.island_code = island_code
-        self.last_action_time = time.time()
-        self.episode_start_time = time.time()
-        self.steps_since_last_kill = 0
-        self.total_kills_in_episode = 0
-
-        # --- Пространство Действий ---
-        # 0: W, 1: A, 2: D, 3: Jump, 4: LMB Attack, 5: turn left, 6: turn right,
-        # 7: Tab (target search), 8: Ability 1, 9: Ability 2, 10: RMB+turn left, 11: RMB+turn right
-        self.action_space = spaces.Discrete(12)
-
-        # --- Пространство Наблюдений ---
-        # Формат (H, W, C) как ранее, чтобы не нарушать совместимость существующего кода
-        self.observation_space = spaces.Box(
-            low=0,
-            high=255,
-            shape=(360, 640, 1),
-            dtype=np.uint8
+    if not GYM_AVAILABLE:
+        raise ImportError(
+            "Для использования FortniteEnv необходим gymnasium. "
+            "Установите: pip install -r requirements-ml.txt"
         )
-        self.last_tab_time = 0.0
-        self.last_action_change_time = time.time()
-
-    def _get_obs(self):
+    
+    class FortniteEnv(gym.Env):
         """
-        Захватывает экран, изменяет размер и переводит в градации серого.
-        """
-        img_bgr = v.capture_screen()
-        img_resized = cv2.resize(img_bgr, (640, 360))
-        img_gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
-        # Возвращаем как (H, W, C)
-        return np.expand_dims(img_gray, axis=-1)
-
-    def _check_for_target(self, obs):
-        # Используем OBS-кадр для распознавания здоровья цели, если доступен; иначе простая эвристика
-        try:
-            frame_bgr = v.capture_obs_frame()
-            return v.detect_enemy_health_bar(frame_bgr)
-        except Exception:
-            return True
-
-    def _check_orientation(self, obs):
-        mean_color = np.mean(obs)
-        if mean_color > 210 or mean_color < 40:
-            return False
-        return True
-
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        print("--- EPISODE RESET ---")
-        self.episode_start_time = time.time()
-        self.steps_since_last_kill = 0
-        self.total_kills_in_episode = 0
-
-        try:
-            self._navigate_to_island()
-        except Exception as e:
-            print(f"FATAL: Failed to navigate to island in reset(): {e}")
-            return np.zeros(self.observation_space.shape, dtype=np.uint8), {}
-
-        print("Environment reset successful. Starting new episode (login/map load success).")
-        return self._get_obs(), {}
-
-    def _navigate_to_island(self):
-        """
-        Выполняет последовательность навигации и кликов для запуска острова,
-        используя новый надежный метод навигации в стиле геймпада.
-        """
-        print("Navigating menus to launch island using keyboard...")
-        # Сначала пытаемся сфокусировать окно облачного стрима/браузера
-        try:
-            v.focus_any_window([
-                "xbox", "cloud gaming", "fortnite", "edge", "chrome", "microsoft xbox"
-            ])
-        except Exception:
-            pass
-        # Разрешаем OS-ввод для pydirectinput/vgamepad
-        v.set_disable_os_input(False)
-        time.sleep(5)
-        # ВАЖНО: Для работы этой функции вам нужно создать новые ассеты:
-        # 'assets/button_focused.png' - общий вид подсвеченной/выделенной кнопки в меню.
-        # Вы можете создать более специфичные ассеты для каждой кнопки, если они сильно отличаются.
-
-        # Шаг 1: Выбрать "Creative Mode"
-        if not v.navigate_and_select_image(
-            page=None, # page=None указывает, что нужно работать с захватом всего экрана
-            target_template_path='assets/creative_mode_button.png',
-            focused_template_path='assets/button_focused.png',
-            navigation_keys=['right', 'down'],
-            confidence=0.8,
-            timeout=90,
-            use_gamepad=True
-        ):
-            raise Exception("Failed to navigate to and select 'Creative Mode'.")
-        time.sleep(1.5)
-
-        # Шаг 2: Выбрать "Island Code"
-        if not v.navigate_and_select_image(
-            page=None,
-            target_template_path='assets/island_code_button.png',
-            focused_template_path='assets/button_focused.png',
-            navigation_keys=['right', 'down'],
-            confidence=0.8,
-            timeout=25,
-            use_gamepad=True
-        ):
-            raise Exception("Failed to navigate to and select 'Island Code'.")
-        time.sleep(1.5)
-
-        # Шаг 3: Выбрать поле ввода кода (здесь клик может быть единственным вариантом)
-        # Оставляем click_on_image, так как поля ввода часто не "выделяются"
-        if not v.click_on_image('assets/island_code_input_field.png', confidence=0.8, timeout=20):
-            raise Exception("Input field for island code not found.")
-        time.sleep(1)
+        Среда Gymnasium для обучения ИИ-агента в Fortnite.
         
-        # Используем новую надежную функцию для ввода текста
-        v.type_text(self.island_code, interval=0.15)
-        v.press_key('enter')
-        time.sleep(2)
-        
-        # Шаг 4: Запустить остров
-        if not v.navigate_and_select_image(
-            page=None,
-            target_template_path='assets/launch_island_button.png',
-            focused_template_path='assets/button_focused.png',
-            navigation_keys=['right', 'up'], # Может понадобиться идти вверх
-            confidence=0.8,
-            timeout=20,
-            use_gamepad=True
-        ):
-            raise Exception("Failed to navigate to and select 'Launch Island'.")
+        Действия:
+            0: W (вперёд)
+            1: A (влево)
+            2: D (вправо)
+            3: Jump (прыжок)
+            4: LMB (атака)
+            5: Turn left (поворот влево)
+            6: Turn right (поворот вправо)
+            7: Tab (поиск цели)
+            8: Ability 1
+            9: Ability 2
+            10: RMB + turn left
+            11: RMB + turn right
+        """
+        metadata = {'render.modes': ['human']}
 
-        print("Island is launching. Waiting for the match to load...")
-        # Ждем исчезновения экрана загрузки / заметной смены сцены
-        # Если есть специфичный индикатор HUD — можно ждать его появления.
-        hud_candidates = [
-            'assets/play_button.png', # пример: индикатор HUD или мини-карта (замените при наличии)
-        ]
-        loaded = False
-        # Сначала пробуем явные образы HUD
-        for path in hud_candidates:
-            if os.path.exists(path):
-                if v.wait_for_image_state(path, should_appear=True, confidence=0.7, timeout=90):
-                    loaded = True
-                    break
-        # Если HUD-ассетов нет, используем смену сцены как эвристику загрузки
-        if not loaded:
-            loaded = v.wait_for_scene_change(timeout=90, sample_interval=1.5, diff_threshold=10.0)
-        if not loaded:
-            raise Exception("Map did not appear in time. Loading seems stuck.")
-        print("Match loaded. Map is visible. Launch success.")
+        def __init__(self, island_code: str):
+            super(FortniteEnv, self).__init__()
+            
+            self.island_code = island_code
+            self.last_action_time = time.time()
+            self.episode_start_time = time.time()
+            self.steps_since_last_kill = 0
+            self.total_kills_in_episode = 0
+            self.last_tab_time = 0.0
+            self.last_action_change_time = time.time()
+            
+            # Используем конфигурацию
+            self.action_space = spaces.Discrete(RL.num_actions)
+            
+            # Пространство наблюдений: grayscale изображение
+            self.observation_space = spaces.Box(
+                low=0,
+                high=255,
+                shape=(VISION.observation_height, VISION.observation_width, 1),
+                dtype=np.uint8
+            )
+            
+            logger.info(f"FortniteEnv инициализирована для острова: {island_code}")
 
-    def step(self, action):
-        reward = -0.01  # базовый шаговый штраф
-        terminated = False
-        truncated = False
-        info = {}
+        def _get_obs(self) -> np.ndarray:
+            """Захватывает экран и преобразует в наблюдение."""
+            try:
+                img_bgr = v.capture_screen()
+                img_resized = cv2.resize(
+                    img_bgr, 
+                    (VISION.observation_width, VISION.observation_height)
+                )
+                img_gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+                return np.expand_dims(img_gray, axis=-1)
+            except Exception as e:
+                logger.error(f"Ошибка захвата экрана: {e}")
+                return np.zeros(self.observation_space.shape, dtype=np.uint8)
 
-        # Для действий внутри игры оставляем pyautogui, так как pydirectinput
-        # может требовать прав администратора и более сложной настройки.
-        # Если pyautogui работает в игре, его можно оставить.
-        # Если нет - нужно будет заменить все вызовы ниже на v.press_key и т.д.
-        # и запускать скрипт с повышенными правами.
-        import pyautogui
+        def _check_for_target(self, obs: np.ndarray) -> bool:
+            """Проверяет наличие цели на экране."""
+            try:
+                frame_bgr = v.capture_obs_frame()
+                return v.detect_enemy_health_bar(frame_bgr)
+            except Exception:
+                return True
 
-        observation = self._get_obs()
-        has_target = self._check_for_target(observation)
-        self.steps_since_last_kill += 1
+        def _check_orientation(self, obs: np.ndarray) -> bool:
+            """Проверяет корректность ориентации (не уткнулся в стену/небо)."""
+            mean_color = np.mean(obs)
+            return 40 <= mean_color <= 210
 
-        if action == 0:  # W
-            pyautogui.keyDown('w'); time.sleep(0.5); pyautogui.keyUp('w')
-            if has_target: reward += 0.05
-        elif action == 1:  # A
-            pyautogui.keyDown('a'); time.sleep(0.2); pyautogui.keyUp('a')
-        elif action == 2:  # D
-            pyautogui.keyDown('d'); time.sleep(0.2); pyautogui.keyUp('d')
-        elif action == 3:  # Jump
-            pyautogui.press('space')
-        elif action == 4:  # LMB attack
-            if has_target:
-                pyautogui.click()
-                reward += 0.5
+        def _execute_action(self, action: int, has_target: bool) -> float:
+            """
+            Выполняет действие и возвращает награду.
+            Использует pydirectinput если доступен, иначе pyautogui.
+            """
+            reward = RL.base_step_penalty
+            
+            # Выбираем модуль ввода
+            if DIRECT_INPUT_AVAILABLE:
+                input_module = pydirectinput
+            elif PYAUTOGUI_AVAILABLE:
+                input_module = pyautogui
             else:
-                reward -= 0.1
-        elif action == 5:  # turn left
-            pyautogui.move(-150, 0, duration=0.15)
-            if has_target: reward += 0.03
-        elif action == 6:  # turn right
-            pyautogui.move(150, 0, duration=0.15)
-            if has_target: reward += 0.03
-        elif action == 7:  # Tab search
-            pyautogui.press('tab')
-            now = time.time()
+                logger.error("Нет доступного модуля ввода!")
+                return reward
+            
+            try:
+                if action == 0:  # W (вперёд)
+                    input_module.keyDown('w')
+                    time.sleep(TIMEOUTS.key_press_duration * 2.5)
+                    input_module.keyUp('w')
+                    if has_target:
+                        reward += RL.movement_with_target_reward
+                        
+                elif action == 1:  # A (влево)
+                    input_module.keyDown('a')
+                    time.sleep(TIMEOUTS.key_press_duration)
+                    input_module.keyUp('a')
+                    
+                elif action == 2:  # D (вправо)
+                    input_module.keyDown('d')
+                    time.sleep(TIMEOUTS.key_press_duration)
+                    input_module.keyUp('d')
+                    
+                elif action == 3:  # Jump
+                    input_module.press('space')
+                    
+                elif action == 4:  # LMB attack
+                    if PYAUTOGUI_AVAILABLE:
+                        pyautogui.click()
+                    reward += RL.attack_with_target_reward if has_target else RL.attack_without_target_penalty
+                    
+                elif action == 5:  # Turn left
+                    if PYAUTOGUI_AVAILABLE:
+                        pyautogui.move(-150, 0, duration=TIMEOUTS.action_delay)
+                    if has_target:
+                        reward += RL.turn_with_target_reward
+                        
+                elif action == 6:  # Turn right
+                    if PYAUTOGUI_AVAILABLE:
+                        pyautogui.move(150, 0, duration=TIMEOUTS.action_delay)
+                    if has_target:
+                        reward += RL.turn_with_target_reward
+                        
+                elif action == 7:  # Tab search
+                    input_module.press('tab')
+                    now = time.time()
+                    if not has_target:
+                        reward += RL.search_reward
+                    if now - self.last_tab_time < RL.search_cooldown:
+                        reward += RL.frequent_search_penalty
+                    self.last_tab_time = now
+                    
+                elif action == 8:  # Ability 1
+                    input_module.press('1')
+                    reward += RL.ability_with_target_reward if has_target else RL.ability_without_target_penalty
+                    
+                elif action == 9:  # Ability 2
+                    input_module.press('2')
+                    reward += RL.ability_with_target_reward if has_target else RL.ability_without_target_penalty
+                    
+                elif action == 10:  # RMB + turn left
+                    if PYAUTOGUI_AVAILABLE:
+                        pyautogui.mouseDown(button='right')
+                        pyautogui.move(-200, 0, duration=TIMEOUTS.key_press_duration)
+                        pyautogui.mouseUp(button='right')
+                    if has_target:
+                        reward += RL.movement_with_target_reward
+                        
+                elif action == 11:  # RMB + turn right
+                    if PYAUTOGUI_AVAILABLE:
+                        pyautogui.mouseDown(button='right')
+                        pyautogui.move(200, 0, duration=TIMEOUTS.key_press_duration)
+                        pyautogui.mouseUp(button='right')
+                    if has_target:
+                        reward += RL.movement_with_target_reward
+                        
+            except Exception as e:
+                logger.error(f"Ошибка выполнения действия {action}: {e}")
+            
+            return reward
+
+        def reset(self, seed=None, options=None):
+            super().reset(seed=seed)
+            logger.info("--- EPISODE RESET ---")
+            
+            self.episode_start_time = time.time()
+            self.steps_since_last_kill = 0
+            self.total_kills_in_episode = 0
+
+            try:
+                self._navigate_to_island()
+            except Exception as e:
+                logger.error(f"FATAL: Не удалось перейти на остров: {e}")
+                return np.zeros(self.observation_space.shape, dtype=np.uint8), {}
+
+            logger.info("Среда сброшена. Начинаем новый эпизод.")
+            return self._get_obs(), {}
+
+        def _navigate_to_island(self):
+            """Навигация по меню для запуска острова."""
+            logger.info("Навигация по меню для запуска острова...")
+            
+            try:
+                v.focus_any_window([
+                    "xbox", "cloud gaming", "fortnite", "edge", "chrome", "microsoft xbox"
+                ])
+            except Exception:
+                pass
+            
+            v.set_disable_os_input(False)
+            time.sleep(5)
+
+            # Шаг 1: Creative Mode
+            if not v.navigate_and_select_image(
+                page=None,
+                target_template_path='assets/creative_mode_button.png',
+                focused_template_path='assets/button_focused.png',
+                navigation_keys=['right', 'down'],
+                confidence=VISION.default_confidence,
+                timeout=TIMEOUTS.game_load,
+                use_gamepad=True
+            ):
+                raise Exception("Не удалось выбрать 'Creative Mode'")
+            time.sleep(1.5)
+
+            # Шаг 2: Island Code
+            if not v.navigate_and_select_image(
+                page=None,
+                target_template_path='assets/island_code_button.png',
+                focused_template_path='assets/button_focused.png',
+                navigation_keys=['right', 'down'],
+                confidence=VISION.default_confidence,
+                timeout=TIMEOUTS.element_wait * 2.5,
+                use_gamepad=True
+            ):
+                raise Exception("Не удалось выбрать 'Island Code'")
+            time.sleep(1.5)
+
+            # Шаг 3: Поле ввода кода
+            if not v.click_on_image(
+                'assets/island_code_input_field.png',
+                confidence=VISION.default_confidence,
+                timeout=TIMEOUTS.element_wait * 2
+            ):
+                raise Exception("Не найдено поле ввода кода острова")
+            time.sleep(1)
+            
+            v.type_text(self.island_code, interval=TIMEOUTS.action_delay)
+            v.press_key('enter')
+            time.sleep(2)
+            
+            # Шаг 4: Launch Island
+            if not v.navigate_and_select_image(
+                page=None,
+                target_template_path='assets/launch_island_button.png',
+                focused_template_path='assets/button_focused.png',
+                navigation_keys=['right', 'up'],
+                confidence=VISION.default_confidence,
+                timeout=TIMEOUTS.element_wait * 2,
+                use_gamepad=True
+            ):
+                raise Exception("Не удалось нажать 'Launch Island'")
+
+            logger.info("Остров запускается. Ожидание загрузки...")
+            
+            # Ожидание загрузки
+            hud_candidates = ['assets/play_button.png']
+            loaded = False
+            
+            for path in hud_candidates:
+                if os.path.exists(path):
+                    if v.wait_for_image_state(
+                        path,
+                        should_appear=True,
+                        confidence=0.7,
+                        timeout=TIMEOUTS.game_load
+                    ):
+                        loaded = True
+                        break
+            
+            if not loaded:
+                loaded = v.wait_for_scene_change(
+                    timeout=TIMEOUTS.game_load,
+                    sample_interval=1.5,
+                    diff_threshold=10.0
+                )
+            
+            if not loaded:
+                raise Exception("Карта не загрузилась вовремя")
+            
+            logger.info("Карта загружена успешно!")
+
+        def step(self, action: int):
+            observation = self._get_obs()
+            has_target = self._check_for_target(observation)
+            self.steps_since_last_kill += 1
+
+            # Выполняем действие и получаем награду
+            reward = self._execute_action(action, has_target)
+            
+            terminated = False
+            truncated = False
+            info = {'kills': self.total_kills_in_episode}
+
+            # Штраф за бездействие при наличии цели
+            if time.time() - self.last_action_time > TIMEOUTS.idle_penalty_threshold and has_target:
+                reward += RL.idle_penalty
+
+            # Штраф за отсутствие цели
             if not has_target:
-                reward += 0.02  # лёгкая награда за поиск
-            if now - self.last_tab_time < 2.0:
-                reward -= 0.05  # штраф за слишком частый Tab
-            self.last_tab_time = now
-        elif action == 8:  # Ability 1
-            if has_target:
-                pyautogui.press('1'); reward += 0.3
-            else:
-                pyautogui.press('1'); reward -= 0.05
-        elif action == 9:  # Ability 2
-            if has_target:
-                pyautogui.press('2'); reward += 0.3
-            else:
-                pyautogui.press('2'); reward -= 0.05
-        elif action == 10:  # RMB + turn left
-            pyautogui.mouseDown(button='right')
-            pyautogui.move(-200, 0, duration=0.2)
-            pyautogui.mouseUp(button='right')
-            if has_target: reward += 0.05
-        elif action == 11:  # RMB + turn right
-            pyautogui.mouseDown(button='right')
-            pyautogui.move(200, 0, duration=0.2)
-            pyautogui.mouseUp(button='right')
-            if has_target: reward += 0.05
+                reward += RL.no_target_penalty
 
-        # Штраф за бездействие при наличии цели
-        if time.time() - self.last_action_time > 5 and has_target:
-            reward -= 0.2
+            # Терминация за долгое отсутствие убийств
+            if self.steps_since_last_kill > RL.steps_without_kill_limit and has_target:
+                reward += RL.no_kill_timeout_penalty
+                terminated = True
+                logger.info("Терминация: слишком долго без убийств")
 
-        if not has_target:
-            reward -= 0.1
+            # Штраф за плохую ориентацию
+            if not self._check_orientation(observation):
+                reward += RL.bad_orientation_penalty
+                logger.debug("Штраф: плохая ориентация")
 
-        if self.steps_since_last_kill > 250 and has_target:
-            reward -= 1.0
-            terminated = True
-            print("Termination: No kill for too long.")
+            self.last_action_time = time.time()
 
-        if not self._check_orientation(observation):
-            reward -= 0.3
-            print("Penalty: Bad orientation.")
+            # Ограничение по времени эпизода
+            if time.time() - self.episode_start_time > TIMEOUTS.episode_max_duration:
+                truncated = True
+                logger.info("Усечение: достигнут лимит времени")
 
-        self.last_action_time = time.time()
+            return self._get_obs(), reward, terminated, truncated, info
 
-        if time.time() - self.episode_start_time > 300:
-            truncated = True
-            print("Truncation: Time limit reached.")
+        def render(self, mode: str = 'human') -> None:
+            """Рендеринг среды (не реализован)."""
+            pass
 
-        obs = self._get_obs()
-        info['kills'] = self.total_kills_in_episode
-        return obs, reward, terminated, truncated, info
+        def close(self) -> None:
+            """Закрытие среды."""
+            logger.info("Закрытие FortniteEnv")
+    
+    return FortniteEnv
 
-    def render(self, mode='human'):
-        pass
 
-    def close(self):
-        print("Closing Fortnite Environment.") 
+# Создаём класс только при импорте, если gymnasium доступен
+if GYM_AVAILABLE:
+    FortniteEnv = _create_fortnite_env_class()
+else:
+    FortniteEnv = None  # type: ignore
