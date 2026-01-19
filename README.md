@@ -1,45 +1,156 @@
-# EpicBot - Cloud Gaming Bot
+# EpicBot - Cloud Gaming Bot v2.1
 
-This project is a bot that automates actions in games through the Microsoft Cloud Gaming (Xbox Cloud Gaming) service. It uses browser automation and computer vision to simulate a real user.
+🎮 Бот для автоматизации действий в играх через Xbox Cloud Gaming с использованием компьютерного зрения и машинного обучения.
 
-## How it works
+## ✨ Возможности
 
-The bot uses the following technologies:
+- **🦊 Camoufox** — Анти-детект браузер на основе Firefox (обход защит)
+- **Браузерная автоматизация** — Playwright + Camoufox для авторизации
+- **Компьютерное зрение** — OpenCV + YOLO для распознавания элементов
+- **RL-агент** — Обучение с подкреплением через Stable-Baselines3 (опционально)
+- **Desktop GUI** — Современный Electron-интерфейс
+- **Мульти-аккаунт** — Поддержка нескольких аккаунтов с прокси
+- **🔒 Шифрование** — Безопасное хранение паролей (AES-128)
 
-- **Python**: The main programming language.
-- **Playwright**: For browser automation (login, game launch).
-- **OpenCV**: For computer vision to detect game elements on the screen.
-- **PyAutoGUI**: To simulate mouse and keyboard inputs.
-- **Stable-Baselines3**: For RL agent training (optional).
+## 📁 Структура проекта
 
-## Project Structure
+```
+fortnitebot/
+├── src/                    # Исходный код Python
+│   ├── __init__.py         # Экспорт модулей
+│   ├── bot_logic.py        # Логика бота и RL-среда
+│   ├── browser.py          # Playwright + Camoufox
+│   ├── config.py           # Конфигурация и константы
+│   ├── db.py               # Работа с SQLite
+│   ├── logger.py           # Централизованное логирование
+│   ├── main.py             # Точка входа
+│   ├── security.py         # Шифрование паролей
+│   ├── stream_input.py     # Управление вводом
+│   └── vision.py           # Компьютерное зрение
+├── desktop/                # Electron GUI
+├── tests/                  # Unit-тесты
+├── config/                 # Конфигурационные файлы
+├── assets/                 # Шаблоны изображений
+├── logs/                   # Логи (автоматически)
+├── requirements.txt        # Основные зависимости
+└── requirements-ml.txt     # ML зависимости (PyTorch, Gym)
+```
 
-- `app.py`: Desktop GUI to manage accounts, proxies, and run multiple bots.
-- `assets/`: Contains image samples for OpenCV to find on the screen (e.g., buttons, icons).
-- `config/`: Stores configuration files, like account credentials.
-- `src/`: Contains the main source code for the bot.
-- `requirements.txt`: A list of Python dependencies.
+## 🚀 Установка
 
-## Setup and Usage
+### 1. Клонирование
 
-1.  **Install dependencies:**
-    ```bash
-    python -m pip install -r requirements.txt
-    ```
-2.  **Install Playwright browsers:**
-    ```bash
-    python -m playwright install
-    ```
-3.  **Configure accounts:**
-    -   Use the GUI to add accounts and save, or
-    -   Create `config/accounts.txt` with lines in the format `login:password`.
-4.  **Assets:**
-    -   Replace placeholder `.png.txt` files by capturing screenshots and saving as `.png` with the same base name (e.g., `creative_mode_button.png`).
-5.  **Run GUI:**
-    ```bash
-    python app.py
-    ```
-6.  **Run CLI (single-run training+play):**
-    ```bash
-    python -m src.main
-    ``` 
+```bash
+git clone https://github.com/your-repo/fortnitebot.git
+cd fortnitebot
+```
+
+### 2. Виртуальное окружение
+
+```bash
+python -m venv venv
+venv\Scripts\activate  # Windows
+```
+
+### 3. Зависимости
+
+**Базовая установка:**
+```bash
+pip install -r requirements.txt
+```
+
+**Установка Camoufox (анти-детект браузер):**
+```bash
+camoufox fetch
+```
+
+**С ML (PyTorch, Gym):**
+```bash
+pip install -r requirements-ml.txt
+```
+
+### 4. Ассеты
+
+Замените файлы-заглушки в `assets/` на скриншоты:
+- `creative_mode_button.png`
+- `island_code_button.png`
+- `island_code_input_field.png`
+- `launch_island_button.png`
+
+## ⚙️ Использование
+
+### GUI
+```bash
+python start_desktop.py
+```
+
+### CLI
+```bash
+python -m src.main
+```
+
+### Тесты
+```bash
+pytest
+```
+
+## 🔒 Безопасность
+
+Пароли автоматически шифруются при сохранении.
+
+**Никогда не коммитьте:**
+- `config/accounts.txt`
+- `config/settings.json`
+- `config/epicbot.db`
+- `config/.secret_key`
+
+## 🦊 Camoufox — Анти-детект браузер
+
+Проект использует [Camoufox](https://github.com/nickolaj-jepsen/camoufox-python) — форк Firefox с защитой от обнаружения:
+
+- ✅ Обход Cloudflare, DataDome и других защит
+- ✅ Эмуляция реальных отпечатков браузера
+- ✅ Интеграция с Playwright API
+
+**Использование:**
+```python
+from src.browser import create_browser, BrowserManager
+
+# Вариант 1: Ручное управление
+browser, page = create_browser(
+    proxy="http://user:pass@host:port",  # опционально
+    headless=False
+)
+# ... работа с page ...
+browser.close()
+
+# Вариант 2: Контекстный менеджер (рекомендуется)
+async with BrowserManager(proxy="...") as bm:
+    page = bm.page
+    await page.goto("https://example.com")
+```
+
+## 📊 Конфигурация
+
+Редактируйте `src/config.py`:
+
+```python
+TIMEOUTS.page_load = 30
+VISION.default_confidence = 0.8
+RL.attack_with_target_reward = 0.5
+BROWSER.headless = False
+```
+
+## 📝 Логирование
+
+Логи: `logs/epicbot_YYYY-MM-DD.log`
+
+```python
+from src.logger import get_logger
+logger = get_logger(__name__)
+logger.info("Сообщение")
+```
+
+## ⚠️ Отказ от ответственности
+
+Проект в образовательных целях. Использование может нарушать ToS игровых сервисов.

@@ -302,29 +302,26 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 			print("Navigating to Xbox Cloud Gaming...")
 			_emit_status("Переход к Xbox Cloud Gaming...")
 			try:
-				page.goto("https://www.xbox.com/play", wait_until="load")
+				page.goto("https://www.xbox.com/play", wait_until="domcontentloaded")
 			except Exception:
 				# Повтор при ERR_ABORTED/закрытии контекста во время навигации
-				time.sleep(1)
+				time.sleep(0.5)
 				page = context.new_page()
 				page.goto("https://www.xbox.com/play", wait_until="domcontentloaded")
-			time.sleep(3)
+			page.wait_for_timeout(1500)  # Оптимизировано: 3s -> 1.5s
 			take_debug_screenshot(page, "initial_page")
 
-			# Handle cookie consent banner
+			# Handle cookie consent banner (оптимизировано: таймаут 7s -> 3s)
 			try:
-				print("Checking for cookie consent banner...")
 				_emit_status("Проверка баннера cookies...")
-				accept_button = page.locator('button:has-text("Accept"), button:has-text("Přijmout")').first
-				accept_button.wait_for(timeout=7000)
+				accept_button = page.locator('button:has-text("Accept"), button:has-text("Přijmout"), button:has-text("Принять")').first
+				accept_button.wait_for(timeout=3000)
 				if accept_button.is_visible():
-					print("Cookie consent banner found. Clicking it.")
 					_emit_status("Закрываю баннер cookies")
 					accept_button.click()
-					page.wait_for_timeout(2000)
+					page.wait_for_timeout(800)  # Оптимизировано: 2s -> 0.8s
 					take_debug_screenshot(page, "after_cookie_accept")
 			except Exception:
-				print("Cookie consent banner not found or already handled, skipping.")
 				_emit_status("Баннер cookies не найден/уже закрыт")
 
 			# Helper: optionally dismiss Microsoft Account Checkup prompt if it appears
@@ -611,11 +608,11 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 						pass
 					time.sleep(0.5)
 				
-				# 3) Stay signed in?
+				# 3) Stay signed in? (Оптимизировано: 20s -> 10s, ускоренный цикл)
 				def handle_kmsi(p) -> bool:
 					yes_texts = ["Да", "Yes", "Sí", "Oui", "Ja", "Sim", "Sì"]
 					prompt_texts = ["Не выходить из системы", "Stay signed in", "No cerrar sesión", "Rester connecté"]
-					deadline = time.time() + 20
+					deadline = time.time() + 10  # Оптимизировано: 20s -> 10s
 					selectors = [
 						'#idSIButton9',
 						'input[type="submit"][value="Да"]',
@@ -639,7 +636,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 									if btn and btn.is_visible():
 										take_debug_screenshot(page, "stay_signed_in_prompt")
 										btn.click()
-										p.wait_for_load_state("networkidle", timeout=15000)
+										p.wait_for_load_state("domcontentloaded", timeout=8000)  # Оптимизировано: networkidle -> domcontentloaded, 15s -> 8s
 										take_debug_screenshot(page, "stay_signed_in_yes_clicked")
 										return True
 								except Exception:
@@ -653,12 +650,12 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 										if btn and btn.is_visible():
 											take_debug_screenshot(page, "stay_signed_in_prompt_iframe")
 											btn.click()
-											fr.wait_for_load_state("networkidle", timeout=15000)
+											fr.wait_for_load_state("domcontentloaded", timeout=8000)
 											take_debug_screenshot(page, "stay_signed_in_yes_clicked_iframe")
 											return True
 									except Exception:
 										continue
-						time.sleep(0.5)
+					time.sleep(0.3)  # Оптимизировано: 0.5 -> 0.3
 					return False
 
 				if not handle_kmsi(page):
@@ -1155,20 +1152,26 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 			def keep_stream_open(p, minutes: int) -> None:
 				seconds = max(1, int(minutes)) * 60
 				print(f"Keeping stream open for {minutes} minutes...")
+				_emit_status(f"Удержание стрима {minutes} мин...")
 				start = time.time()
+				activity_interval = 30  # Оптимизировано: 15s -> 30s для меньшей нагрузки
+				last_activity = start
 				while time.time() - start < seconds:
-					# Лёгкая активность, чтобы не отваливалось из‑за простоя
-					try:
-						p.keyboard.press('Shift')
-					except Exception:
-						pass
+					now = time.time()
+					# Лёгкая активность только каждые activity_interval секунд
+					if now - last_activity >= activity_interval:
+						try:
+							p.keyboard.press('Shift')
+						except Exception:
+							pass
+						last_activity = now
 					# Попытаться вернуть фуллскрин при любом возникновении попапов
 					try:
 						if not click_return_to_fullscreen_if_present(p):
 							click_enter_fullscreen_overlay_if_present(p)
 					except Exception:
 						pass
-					p.wait_for_timeout(15000)  # 15s
+					p.wait_for_timeout(5000)  # Оптимизировано: 15s -> 5s проверки, но реже шлём клавиши
 
 			# NEW: минимальный пост‑Play поток — просто удерживаем стрим, без авто‑детекта/поиска/YOLO (будет переписано)
 			# Удалено раннее удержание и return — продолжим к сценарию In-Game Automation ниже
@@ -1185,7 +1188,7 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 				except Exception:
 					pass
 
-			def wait_for_lobby_ui(p, timeout_sec: int = 120) -> bool:
+			def wait_for_lobby_ui(p, timeout_sec: int = 90) -> bool:  # Оптимизировано: 120s -> 90s
 				"""Ждём появления лупы (верх‑лево) и стабильности кадра. Дополнительно ждём исчезновения CONNECTING/LOGGING IN и подсказки F9.
 				Добавлены: более широкие ROI/масштабы, сниженный порог, DOM‑фолбэк и канвас‑фолбэк без загрузочных оверлеев."""
 				ensure_stream_focus()
@@ -1198,9 +1201,9 @@ def run_bot(account, island_code, headless=False, proxy=None, manual_lobby_event
 					(0.0, 0.0, 1.0, 0.22),     # вся верхняя полоса
 				]
 				scales = [0.70, 0.85, 1.0, 1.15, 1.30]
-				high_conf = 0.86
-				stable_needed = 3
-				no_overlay_streak_needed = 3
+				high_conf = 0.84  # Оптимизировано: 0.86 -> 0.84 для более быстрого матчинга
+				stable_needed = 2  # Оптимизировано: 3 -> 2 для ускорения
+				no_overlay_streak_needed = 2  # Оптимизировано: 3 -> 2
 				no_overlay_streak = 0
 				while time.time() < deadline:
 					# NEW: закрываем предупреждение об выходе из полноэкранного режима, если всплыло

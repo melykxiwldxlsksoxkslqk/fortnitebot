@@ -2,8 +2,11 @@ import pyautogui
 import cv2
 import numpy as np
 import time
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, List, Union
+from enum import Enum, auto
 import os
+import hashlib
+
 try:
     from ultralytics import YOLO as _YOLO
 except Exception:
@@ -11,10 +14,46 @@ except Exception:
 
 _yolo_model = None
 
+
+class ScreenState(Enum):
+    """Состояния экрана для умной детекции."""
+    UNKNOWN = auto()
+    LOADING = auto()           # Экран загрузки (тёмный, спиннер)
+    CONNECTING = auto()        # CONNECTING/LOGGING IN оверлей
+    PLANE_SCREEN = auto()      # Зелёный самолёт Xbox
+    XBOX_LOADING = auto()      # Xbox Cloud Gaming загрузка
+    LOGIN_PAGE = auto()        # Страница входа
+    LOBBY = auto()             # Лобби Fortnite
+    IN_GAME = auto()           # В игре
+    MENU = auto()              # Меню/настройки
+    ERROR = auto()             # Ошибка/диалог
+
+
 # Кэш загруженных шаблонов (RGB, optional alpha)
 _TEMPLATE_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
 # Кэш последнего найденного прямоугольника по шаблону (в абсолютных координатах кадра)
 _LAST_RECT_CACHE: Dict[str, Tuple[int, int, int, int]] = {}
+# Кэш хешей шаблонов для быстрого сравнения
+_TEMPLATE_HASH_CACHE: Dict[str, np.ndarray] = {}
+# Адаптивный кэш порогов confidence для каждого шаблона
+_ADAPTIVE_CONFIDENCE: Dict[str, float] = {}
+# Кэш последнего определённого состояния экрана
+_LAST_SCREEN_STATE: ScreenState = ScreenState.UNKNOWN
+_LAST_SCREEN_STATE_TIME: float = 0.0
+
+
+def _compute_template_hash(template_gray: np.ndarray) -> np.ndarray:
+    """Вычисляет perceptual hash шаблона для быстрого сравнения."""
+    try:
+        # pHash через cv2 если доступен
+        if hasattr(cv2, 'img_hash') and hasattr(cv2.img_hash, 'pHash'):
+            return cv2.img_hash.pHash(template_gray)
+    except Exception:
+        pass
+    # Фолбэк: простой средний хэш
+    resized = cv2.resize(template_gray, (8, 8), interpolation=cv2.INTER_AREA)
+    mean_val = resized.mean()
+    return (resized > mean_val).flatten().astype(np.uint8)
 
 
 def _load_template_cached(resolved_path: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -30,6 +69,14 @@ def _load_template_cached(resolved_path: str) -> Tuple[np.ndarray, np.ndarray]:
         template_rgb = template
         alpha_channel = None  # type: ignore
     _TEMPLATE_CACHE[resolved_path] = (template_rgb, alpha_channel)
+    
+    # Вычисляем и кэшируем хэш
+    try:
+        gray = cv2.cvtColor(template_rgb, cv2.COLOR_BGR2GRAY)
+        _TEMPLATE_HASH_CACHE[resolved_path] = _compute_template_hash(gray)
+    except Exception:
+        pass
+    
     return _TEMPLATE_CACHE[resolved_path]
 
 
@@ -44,21 +91,27 @@ def yolo_load_model(weights_path: str = os.path.join('config', 'yolo', 'model.pt
     _yolo_model = _YOLO(weights_path)
     return _yolo_model
 
-def yolo_detect(frame_bgr, conf: float = 0.35):
+
+def yolo_detect(frame_bgr, conf: float = 0.35, classes: List[int] = None) -> List[dict]:
     """
     Выполняет детекцию YOLO по кадру BGR. Возвращает список детекций:
-    [{"cls": int, "name": str, "conf": float, "xyxy": (x1,y1,x2,y2)}]
+    [{"cls": int, "name": str, "conf": float, "xyxy": (x1,y1,x2,y2), "center": (cx, cy)}]
+    
+    Параметры:
+    - frame_bgr: BGR изображение
+    - conf: минимальный порог уверенности
+    - classes: список ID классов для фильтрации (None = все)
     """
     if _YOLO is None:
         return []
     try:
         model = yolo_load_model()
     except Exception:
-        # Нет ultralytics или нет весов — тихий фолбэк
         return []
+    
     # Ultralytics ожидает RGB
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    res = model.predict(source=frame_rgb, verbose=False, conf=conf, device='cpu')
+    res = model.predict(source=frame_rgb, verbose=False, conf=conf, device='cpu', classes=classes)
     out = []
     try:
         r0 = res[0]
@@ -69,10 +122,40 @@ def yolo_detect(frame_bgr, conf: float = 0.35):
             x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]
             conf_v = float(b.conf[0].item()) if hasattr(b.conf[0], 'item') else float(b.conf[0])
             cls_id = int(b.cls[0].item()) if hasattr(b.cls[0], 'item') else int(b.cls[0])
-            out.append({"cls": cls_id, "name": names.get(cls_id, str(cls_id)), "conf": conf_v, "xyxy": (x1, y1, x2, y2)})
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            out.append({
+                "cls": cls_id, 
+                "name": names.get(cls_id, str(cls_id)), 
+                "conf": conf_v, 
+                "xyxy": (x1, y1, x2, y2),
+                "center": (cx, cy),
+                "width": x2 - x1,
+                "height": y2 - y1
+            })
     except Exception:
         return []
+    
+    # Сортируем по уверенности (убывание)
+    out.sort(key=lambda d: d['conf'], reverse=True)
     return out
+
+
+def yolo_detect_best(frame_bgr, target_names: List[str], conf: float = 0.35) -> Optional[dict]:
+    """
+    Находит лучшую детекцию среди указанных классов по имени.
+    Возвращает детекцию с наибольшей уверенностью или None.
+    """
+    dets = yolo_detect(frame_bgr, conf=conf)
+    target_lower = [n.lower() for n in target_names]
+    
+    best = None
+    for d in dets:
+        name = (d.get('name', '') or '').lower()
+        if any(t in name or name in t for t in target_lower):
+            if best is None or d['conf'] > best['conf']:
+                best = d
+    return best
 
 _obs_captures: Dict[int, cv2.VideoCapture] = {}
 
@@ -80,15 +163,302 @@ _obs_captures: Dict[int, cv2.VideoCapture] = {}
 # Глобальный флаг: принудительно включать debug-режим в функциях поиска
 _GLOBAL_DEBUG_ALWAYS = False
 
-# Дополнительные пороги для подавления ложных срабатываний шаблонного сопоставления
-_PEAK_RATIO_MIN = 1.03  # отношение лучшего пика ко второму лучшему (было 1.07)
-_STABLE_FRAMES_NEEDED = 1  # достаточно одного кадра при хорошем совпадении (было 2)
-_STABLE_RADIUS_PX = 16     # радиус стабильности центра, px (было 12)
+# Улучшенные пороги для более точного и быстрого матчинга
+_PEAK_RATIO_MIN = 1.02  # Снижено для лучшего отлова (было 1.03)
+_STABLE_FRAMES_NEEDED = 1  # Один кадр достаточно при хорошем совпадении
+_STABLE_RADIUS_PX = 20     # Увеличен радиус стабильности (было 16)
+_MULTI_SCALE_DEFAULT = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.5]  # Более широкий диапазон
+_ROTATION_ANGLES = [-15, -10, -5, -2, 0, 2, 5, 10, 15]  # Больше углов поворота
+
+# Кэш для адаптивного подбора лучших параметров
+_MATCH_HISTORY: Dict[str, List[Tuple[float, float, float]]] = {}  # path -> [(conf, scale, angle)]
 
 
 def set_global_debug(enabled: bool) -> None:
     global _GLOBAL_DEBUG_ALWAYS
     _GLOBAL_DEBUG_ALWAYS = bool(enabled)
+
+
+def get_optimal_scales_for_template(template_path: str) -> List[float]:
+    """
+    Возвращает оптимальные масштабы для шаблона на основе истории совпадений.
+    """
+    resolved = resolve_asset_path(template_path)
+    history = _MATCH_HISTORY.get(resolved, [])
+    
+    if len(history) < 3:
+        return _MULTI_SCALE_DEFAULT
+    
+    # Анализируем успешные масштабы
+    scales = [h[1] for h in history[-10:]]  # Последние 10 совпадений
+    avg_scale = sum(scales) / len(scales)
+    
+    # Генерируем масштабы вокруг среднего
+    return [
+        avg_scale * 0.7,
+        avg_scale * 0.85,
+        avg_scale * 0.95,
+        avg_scale,
+        avg_scale * 1.05,
+        avg_scale * 1.15,
+        avg_scale * 1.3
+    ]
+
+
+def _record_match_success(template_path: str, confidence: float, scale: float, angle: float = 0.0):
+    """Записывает успешное совпадение для адаптивной оптимизации."""
+    resolved = resolve_asset_path(template_path)
+    if resolved not in _MATCH_HISTORY:
+        _MATCH_HISTORY[resolved] = []
+    _MATCH_HISTORY[resolved].append((confidence, scale, angle))
+    # Ограничиваем историю
+    if len(_MATCH_HISTORY[resolved]) > 50:
+        _MATCH_HISTORY[resolved] = _MATCH_HISTORY[resolved][-50:]
+
+
+# ============================================================================
+# НОВЫЕ УМНЫЕ ФУНКЦИИ РАСПОЗНАВАНИЯ
+# ============================================================================
+
+def detect_color_region(img_bgr: np.ndarray, color_name: str, roi: Tuple[float, float, float, float] = None) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Находит область с указанным цветом. Поддерживаемые цвета:
+    'green', 'red', 'blue', 'yellow', 'cyan', 'white', 'orange', 'purple'
+    
+    Возвращает (x, y, w, h) или None.
+    """
+    h, w = img_bgr.shape[:2]
+    
+    # Применяем ROI если указан
+    if roi:
+        x0, y0, x1, y1 = _resolve_roi_abs(w, h, roi)
+        crop = img_bgr[y0:y1, x0:x1]
+    else:
+        x0, y0 = 0, 0
+        crop = img_bgr
+    
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    
+    # Диапазоны цветов в HSV
+    color_ranges = {
+        'green': [(35, 50, 50), (85, 255, 255)],
+        'red': [(0, 100, 100), (10, 255, 255)],  # + [(170, 100, 100), (180, 255, 255)]
+        'blue': [(100, 100, 100), (130, 255, 255)],
+        'yellow': [(20, 100, 100), (35, 255, 255)],
+        'cyan': [(85, 100, 100), (100, 255, 255)],
+        'white': [(0, 0, 200), (180, 30, 255)],
+        'orange': [(10, 100, 100), (20, 255, 255)],
+        'purple': [(130, 50, 50), (160, 255, 255)],
+    }
+    
+    color_name = color_name.lower()
+    if color_name not in color_ranges:
+        return None
+    
+    lower, upper = color_ranges[color_name]
+    mask = cv2.inRange(hsv, np.array(lower, dtype=np.uint8), np.array(upper, dtype=np.uint8))
+    
+    # Для красного добавляем второй диапазон
+    if color_name == 'red':
+        mask2 = cv2.inRange(hsv, np.array([170, 100, 100], dtype=np.uint8), np.array([180, 255, 255], dtype=np.uint8))
+        mask = cv2.bitwise_or(mask, mask2)
+    
+    # Морфология для очистки
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    
+    # Находим контуры
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return None
+    
+    # Берём самый большой контур
+    largest = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest) < 100:  # Минимальная площадь
+        return None
+    
+    rx, ry, rw, rh = cv2.boundingRect(largest)
+    return (x0 + rx, y0 + ry, rw, rh)
+
+
+def detect_text_region(img_bgr: np.ndarray, target_text: str = None, roi: Tuple[float, float, float, float] = None) -> List[dict]:
+    """
+    Пытается найти текстовые области на изображении.
+    Использует EAST детектор если доступен, иначе эвристику по контурам.
+    
+    Возвращает список: [{"bbox": (x,y,w,h), "confidence": float}]
+    """
+    h, w = img_bgr.shape[:2]
+    
+    if roi:
+        x0, y0, x1, y1 = _resolve_roi_abs(w, h, roi)
+        crop = img_bgr[y0:y1, x0:x1]
+    else:
+        x0, y0 = 0, 0
+        crop = img_bgr
+    
+    results = []
+    
+    # Эвристика на основе морфологии для детекции текстовых блоков
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    
+    # Бинаризация
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Расширяем для объединения букв в слова
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+    
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    for cnt in contours:
+        rx, ry, rw, rh = cv2.boundingRect(cnt)
+        
+        # Фильтруем по соотношению сторон (текст обычно горизонтальный)
+        aspect = rw / max(1, rh)
+        if aspect < 1.5 or rh < 10 or rw < 30:
+            continue
+        
+        # Оценка "текстовости" региона
+        region = gray[ry:ry+rh, rx:rx+rw]
+        variance = np.var(region)
+        
+        results.append({
+            "bbox": (x0 + rx, y0 + ry, rw, rh),
+            "confidence": min(1.0, variance / 2000)  # Эвристическая оценка
+        })
+    
+    # Сортируем по уверенности
+    results.sort(key=lambda r: r['confidence'], reverse=True)
+    return results
+
+
+def detect_button(img_bgr: np.ndarray, button_color: str = 'green', roi: Tuple[float, float, float, float] = None) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Находит кнопку по цвету и форме (прямоугольник с закруглёнными углами).
+    """
+    region = detect_color_region(img_bgr, button_color, roi)
+    if region is None:
+        return None
+    
+    x, y, w, h = region
+    
+    # Проверяем что это похоже на кнопку (соотношение сторон)
+    aspect = w / max(1, h)
+    if aspect < 1.5 or aspect > 8:  # Кнопки обычно горизонтальные
+        return None
+    
+    if w < 50 or h < 20:  # Минимальный размер кнопки
+        return None
+    
+    return region
+
+
+def detect_ui_elements(page_or_img, element_types: List[str] = None) -> Dict[str, List[dict]]:
+    """
+    Комплексное обнаружение UI элементов на странице или изображении.
+    
+    element_types: ['buttons', 'text', 'icons', 'inputs']
+    
+    Возвращает словарь с найденными элементами.
+    """
+    if hasattr(page_or_img, 'screenshot'):
+        img = _capture_page_bgr(page_or_img)
+    else:
+        img = page_or_img
+    
+    if element_types is None:
+        element_types = ['buttons', 'text']
+    
+    results = {}
+    
+    if 'buttons' in element_types:
+        results['buttons'] = []
+        for color in ['green', 'blue', 'red', 'orange']:
+            btn = detect_button(img, color)
+            if btn:
+                results['buttons'].append({
+                    'bbox': btn,
+                    'color': color,
+                    'center': (btn[0] + btn[2]//2, btn[1] + btn[3]//2)
+                })
+    
+    if 'text' in element_types:
+        results['text'] = detect_text_region(img)
+    
+    return results
+
+
+def smart_find_element(page_or_img, description: str, timeout: float = 5.0) -> Optional[Tuple[int, int]]:
+    """
+    Умный поиск элемента по описанию. Комбинирует несколько методов:
+    1. Поиск по шаблону (если есть ассет)
+    2. Поиск по цвету
+    3. YOLO детекция
+    4. Эвристика UI
+    
+    Возвращает координаты центра элемента или None.
+    """
+    if hasattr(page_or_img, 'screenshot'):
+        img = _capture_page_bgr(page_or_img)
+        is_page = True
+    else:
+        img = page_or_img
+        is_page = False
+    
+    desc_lower = description.lower()
+    
+    # 1. Пробуем найти ассет по имени
+    asset_candidates = [
+        f'assets/{description}.png',
+        f'assets/{description.replace(" ", "_")}.png',
+        f'assets/{description.replace(" ", "_").lower()}.png',
+    ]
+    
+    for asset_path in asset_candidates:
+        resolved = resolve_asset_path(asset_path)
+        if os.path.exists(resolved):
+            try:
+                template_rgb, alpha = _load_template_cached(resolved)
+                found = _match_on_image(img, template_rgb, alpha, 0.7, _MULTI_SCALE_DEFAULT, False, _ROTATION_ANGLES)
+                if found:
+                    return found
+            except Exception:
+                pass
+    
+    # 2. Поиск по цвету если в описании есть цвет
+    color_keywords = {
+        'green': ['green', 'play', 'start', 'ok', 'confirm', 'зелён', 'играть', 'старт'],
+        'red': ['red', 'cancel', 'stop', 'exit', 'красн', 'отмена', 'стоп', 'выход'],
+        'blue': ['blue', 'link', 'синий', 'ссылка'],
+        'yellow': ['yellow', 'warning', 'жёлт', 'предупр'],
+    }
+    
+    for color, keywords in color_keywords.items():
+        if any(kw in desc_lower for kw in keywords):
+            region = detect_color_region(img, color)
+            if region:
+                x, y, w, h = region
+                return (x + w // 2, y + h // 2)
+    
+    # 3. YOLO детекция
+    if _YOLO is not None:
+        dets = yolo_detect(img, conf=0.3)
+        for d in dets:
+            name = (d.get('name', '') or '').lower()
+            if desc_lower in name or name in desc_lower:
+                return (int(d['center'][0]), int(d['center'][1]))
+    
+    # 4. Поиск кнопки если в описании есть "button" или "кнопка"
+    if 'button' in desc_lower or 'кнопк' in desc_lower:
+        for color in ['green', 'blue', 'red']:
+            btn = detect_button(img, color)
+            if btn:
+                return (btn[0] + btn[2]//2, btn[1] + btn[3]//2)
+    
+    return None
 
 def _capture_page_bgr(page) -> np.ndarray:
     """
@@ -557,37 +927,100 @@ def detect_connecting_overlay_on_page(page) -> bool:
     """
     try:
         img = _capture_page_bgr(page)
+        return _detect_connecting_overlay(img)
+    except Exception:
+        return False
+
+
+def _detect_connecting_overlay(img: np.ndarray) -> bool:
+    """Внутренняя функция детекции оверлея CONNECTING на изображении."""
+    try:
         h, w = img.shape[:2]
         def roi_abs(fr):
             x0 = max(0, min(w - 1, int(w * fr[0]))); y0 = max(0, min(h - 1, int(h * fr[1])))
             x1 = max(0, min(w, int(w * fr[2])));     y1 = max(0, min(h, int(h * fr[3])))
             return x0, y0, x1, y1
-        # Две зоны: левый-низ (CONNECTING...) и центр-низ (LOGGING IN...)
+        
+        # Расширенные зоны поиска
         rois = [
-            (0.00, 0.82, 0.42, 0.99),  # шире слева снизу
-            (0.28, 0.72, 0.76, 0.94),  # центр-низ
-            (0.00, 0.74, 1.00, 0.98),  # общий низ как резерв
+            (0.00, 0.80, 0.50, 0.99),  # левый-низ
+            (0.25, 0.70, 0.75, 0.95),  # центр-низ
+            (0.00, 0.70, 1.00, 0.99),  # весь низ
+            (0.30, 0.40, 0.70, 0.60),  # центр экрана (loading spinner)
         ]
-        # Циан/бирюза в HSV — расширим диапазон оттенков
-        lower = np.array([60, 40, 100], dtype=np.uint8)
-        upper = np.array([130, 255, 255], dtype=np.uint8)
+        
+        # Циан/бирюза в HSV — широкий диапазон
+        cyan_lower = np.array([60, 40, 100], dtype=np.uint8)
+        cyan_upper = np.array([130, 255, 255], dtype=np.uint8)
+        
+        # Белый текст (тоже часто используется)
+        white_lower = np.array([0, 0, 200], dtype=np.uint8)
+        white_upper = np.array([180, 40, 255], dtype=np.uint8)
+        
         for fr in rois:
             x0, y0, x1, y1 = roi_abs(fr)
             if x1 <= x0 or y1 <= y0:
                 continue
             roi = img[y0:y1, x0:x1]
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            mask = cv2.inRange(hsv, lower, upper)
-            # Сгладим и чуть закроем пробелы внутри букв, чтобы ловить тонкий шрифт
-            mask = cv2.medianBlur(mask, 3)
+            
+            # Проверяем циановые пиксели
+            mask_cyan = cv2.inRange(hsv, cyan_lower, cyan_upper)
+            mask_cyan = cv2.medianBlur(mask_cyan, 3)
             kernel = np.ones((3, 3), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
-            ratio = float(np.count_nonzero(mask)) / float(mask.size)
-            if ratio > 0.003:  # ~0.3% пикселей циановые — вероятно CONNECTING/LOGGING
+            mask_cyan = cv2.morphologyEx(mask_cyan, cv2.MORPH_CLOSE, kernel, iterations=1)
+            
+            ratio_cyan = float(np.count_nonzero(mask_cyan)) / float(mask_cyan.size)
+            if ratio_cyan > 0.002:  # Снижен порог для лучшего отлова
                 return True
+            
+            # Проверяем белый текст на тёмном фоне
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            mean_bright = np.mean(gray)
+            if mean_bright < 60:  # Тёмный фон
+                mask_white = cv2.inRange(hsv, white_lower, white_upper)
+                ratio_white = float(np.count_nonzero(mask_white)) / float(mask_white.size)
+                if ratio_white > 0.01:  # Текст на тёмном фоне
+                    return True
+        
         return False
     except Exception:
         return False
+
+
+def detect_loading_spinner(page_or_img) -> bool:
+    """
+    Определяет наличие спиннера загрузки (крутящегося индикатора).
+    """
+    try:
+        if hasattr(page_or_img, 'screenshot'):
+            img = _capture_page_bgr(page_or_img)
+        else:
+            img = page_or_img
+        
+        h, w = img.shape[:2]
+        # Центральная область где обычно спиннер
+        cx, cy = w // 2, h // 2
+        roi_size = min(w, h) // 4
+        x0 = max(0, cx - roi_size)
+        y0 = max(0, cy - roi_size)
+        x1 = min(w, cx + roi_size)
+        y1 = min(h, cy + roi_size)
+        
+        roi = img[y0:y1, x0:x1]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Детектируем круги (спиннеры обычно круглые)
+        circles = cv2.HoughCircles(
+            gray, cv2.HOUGH_GRADIENT, 1, 20,
+            param1=50, param2=30,
+            minRadius=15, maxRadius=100
+        )
+        
+        return circles is not None and len(circles[0]) > 0
+    except Exception:
+        return False
+
 
 # --- NEW: Heuristic detection of plane launch screen ---
 def detect_plane_screen_on_page(page) -> bool:
@@ -598,19 +1031,134 @@ def detect_plane_screen_on_page(page) -> bool:
     """
     try:
         img = _capture_page_bgr(page)
+        return _detect_plane_screen(img)
+    except Exception:
+        return False
+
+
+def _detect_plane_screen(img: np.ndarray) -> bool:
+    """Внутренняя функция детекции plane screen."""
+    try:
         h, w = img.shape[:2]
+        
+        # Проверяем что фон тёмный (характерно для этого экрана)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        mean_brightness = np.mean(gray)
+        if mean_brightness > 80:  # Слишком светлый - не тот экран
+            return False
+        
         # Центральная зона, где находится самолёт и зелёные полосы
-        x0 = int(w * 0.20); x1 = int(w * 0.80)
-        y0 = int(h * 0.30); y1 = int(h * 0.75)
+        x0 = int(w * 0.15); x1 = int(w * 0.85)
+        y0 = int(h * 0.20); y1 = int(h * 0.80)
         roi = img[y0:y1, x0:x1]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        # Ярко-зелёный/салатовый диапазон
-        lower = np.array([40, 60, 110], dtype=np.uint8)
-        upper = np.array([90, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.medianBlur(mask, 3)
+        
+        # Ярко-зелёный/салатовый диапазон (самолёт и полосы)
+        green_lower = np.array([35, 50, 100], dtype=np.uint8)
+        green_upper = np.array([95, 255, 255], dtype=np.uint8)
+        mask_green = cv2.inRange(hsv, green_lower, green_upper)
+        mask_green = cv2.medianBlur(mask_green, 3)
+        ratio_green = float(np.count_nonzero(mask_green)) / float(mask_green.size)
+        
+        if ratio_green > 0.001:  # Есть зелёные элементы
+            return True
+        
+        # Альтернативно: ищем характерные линии (полосы на экране загрузки)
+        edges = cv2.Canny(gray[y0:y1, x0:x1], 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, minLineLength=50, maxLineGap=10)
+        if lines is not None and len(lines) > 3:
+            # Есть характерные линии на тёмном фоне
+            return True
+        
+        return False
+    except Exception:
+        return False
+
+
+def detect_xbox_loading_screen(page_or_img) -> bool:
+    """
+    Детектирует экран загрузки Xbox Cloud Gaming (зелёный/тёмный фон с лого).
+    """
+    try:
+        if hasattr(page_or_img, 'screenshot'):
+            img = _capture_page_bgr(page_or_img)
+        else:
+            img = page_or_img
+        
+        h, w = img.shape[:2]
+        
+        # Проверяем наличие Xbox зелёного цвета
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # Xbox зелёный
+        xbox_green_lower = np.array([35, 100, 50], dtype=np.uint8)
+        xbox_green_upper = np.array([85, 255, 255], dtype=np.uint8)
+        
+        mask = cv2.inRange(hsv, xbox_green_lower, xbox_green_upper)
         ratio = float(np.count_nonzero(mask)) / float(mask.size)
-        return ratio > 0.0015  # ~0.15% зелёных пикселей в центре
+        
+        # Если значительная часть экрана зелёная - это Xbox loading
+        if ratio > 0.05:
+            return True
+        
+        # Проверяем тёмный экран с белым текстом (другой вариант загрузки)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        mean_bright = np.mean(gray)
+        
+        if mean_bright < 50:  # Очень тёмный экран
+            # Проверяем наличие белых элементов (текст/лого)
+            _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+            white_ratio = float(np.count_nonzero(thresh)) / float(thresh.size)
+            if 0.005 < white_ratio < 0.15:  # Есть текст но не много
+                return True
+        
+        return False
+    except Exception:
+        return False
+
+
+def detect_game_ready(page_or_img) -> bool:
+    """
+    Определяет, что игра загрузилась и готова к управлению.
+    Ищет характерные UI элементы Fortnite.
+    """
+    try:
+        if hasattr(page_or_img, 'screenshot'):
+            img = _capture_page_bgr(page_or_img)
+        else:
+            img = page_or_img
+        
+        h, w = img.shape[:2]
+        
+        # Проверяем что экран не слишком тёмный (загрузка) и не слишком однородный
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        mean_bright = np.mean(gray)
+        std_bright = np.std(gray)
+        
+        # Игровой экран обычно имеет среднюю яркость и высокую вариативность
+        if mean_bright < 30 or mean_bright > 250:
+            return False
+        
+        if std_bright < 20:  # Слишком однородный - вероятно загрузка
+            return False
+        
+        # Проверяем верхнюю часть на наличие UI (HP бар, миникарта)
+        top_roi = img[0:int(h*0.15), :]
+        top_gray = cv2.cvtColor(top_roi, cv2.COLOR_BGR2GRAY)
+        edges_top = cv2.Canny(top_gray, 50, 150)
+        edge_ratio_top = float(np.count_nonzero(edges_top)) / float(edges_top.size)
+        
+        # Проверяем нижнюю часть на наличие UI (инвентарь, хотбар)
+        bottom_roi = img[int(h*0.85):, :]
+        bottom_gray = cv2.cvtColor(bottom_roi, cv2.COLOR_BGR2GRAY)
+        edges_bottom = cv2.Canny(bottom_gray, 50, 150)
+        edge_ratio_bottom = float(np.count_nonzero(edges_bottom)) / float(edges_bottom.size)
+        
+        # Игра готова если есть UI элементы сверху и снизу
+        if edge_ratio_top > 0.02 and edge_ratio_bottom > 0.02:
+            return True
+        
+        return False
     except Exception:
         return False
 
@@ -1525,3 +2073,229 @@ def _get_current_frame(page):
         return _capture_page_bgr(page) if page is not None else capture_screen()
     except Exception:
         return capture_screen()
+
+
+# ============================================================================
+# SMART STATE DETECTION - Главная функция определения состояния экрана
+# ============================================================================
+
+def detect_screen_state(page_or_img, use_cache: bool = True) -> ScreenState:
+    """
+    Интеллектуальное определение текущего состояния экрана.
+    Возвращает одно из значений ScreenState enum.
+    
+    Args:
+        page_or_img: Playwright page или BGR изображение
+        use_cache: Использовать кэш (если состояние недавно определялось)
+    
+    Returns:
+        ScreenState - текущее состояние экрана
+    """
+    global _LAST_SCREEN_STATE, _LAST_SCREEN_STATE_TIME
+    
+    # Используем кэш если состояние определялось недавно
+    if use_cache and time.time() - _LAST_SCREEN_STATE_TIME < 0.5:
+        return _LAST_SCREEN_STATE
+    
+    try:
+        # Получаем изображение
+        if hasattr(page_or_img, 'screenshot'):
+            img = _capture_page_bgr(page_or_img)
+        else:
+            img = page_or_img
+        
+        state = _analyze_screen_state(img)
+        
+        # Кэшируем результат
+        _LAST_SCREEN_STATE = state
+        _LAST_SCREEN_STATE_TIME = time.time()
+        
+        return state
+    except Exception:
+        return ScreenState.UNKNOWN
+
+
+def _analyze_screen_state(img: np.ndarray) -> ScreenState:
+    """Внутренняя функция анализа состояния экрана."""
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # Базовые метрики
+    mean_brightness = np.mean(gray)
+    std_brightness = np.std(gray)
+    
+    # 1. Проверяем CONNECTING оверлей (высокий приоритет)
+    if _detect_connecting_overlay(img):
+        return ScreenState.CONNECTING
+    
+    # 2. Проверяем plane screen (зелёный самолёт)
+    if _detect_plane_screen(img):
+        return ScreenState.PLANE_SCREEN
+    
+    # 3. Проверяем Xbox loading (очень тёмный с зелёными элементами)
+    if mean_brightness < 40:
+        # Проверяем Xbox зелёный
+        xbox_lower = np.array([35, 100, 50], dtype=np.uint8)
+        xbox_upper = np.array([85, 255, 255], dtype=np.uint8)
+        mask_xbox = cv2.inRange(hsv, xbox_lower, xbox_upper)
+        if np.count_nonzero(mask_xbox) / mask_xbox.size > 0.01:
+            return ScreenState.XBOX_LOADING
+        
+        # Общий экран загрузки (тёмный с минимальным контентом)
+        if std_brightness < 30:
+            return ScreenState.LOADING
+    
+    # 4. Проверяем страницу входа (обычно светлая с формами)
+    # Белый фон с голубыми/синими элементами Microsoft
+    white_lower = np.array([0, 0, 200], dtype=np.uint8)
+    white_upper = np.array([180, 30, 255], dtype=np.uint8)
+    mask_white = cv2.inRange(hsv, white_lower, white_upper)
+    white_ratio = np.count_nonzero(mask_white) / mask_white.size
+    
+    if white_ratio > 0.5:  # Много белого - вероятно страница входа
+        # Проверяем наличие синих элементов (кнопки Microsoft)
+        blue_lower = np.array([100, 50, 50], dtype=np.uint8)
+        blue_upper = np.array([130, 255, 255], dtype=np.uint8)
+        mask_blue = cv2.inRange(hsv, blue_lower, blue_upper)
+        if np.count_nonzero(mask_blue) / mask_blue.size > 0.005:
+            return ScreenState.LOGIN_PAGE
+    
+    # 5. Проверяем игровой экран (высокая вариативность, UI элементы)
+    if std_brightness > 40:
+        # Проверяем наличие UI в типичных местах
+        top_ui = img[0:int(h*0.12), :]
+        bottom_ui = img[int(h*0.85):, :]
+        
+        top_edges = cv2.Canny(cv2.cvtColor(top_ui, cv2.COLOR_BGR2GRAY), 50, 150)
+        bottom_edges = cv2.Canny(cv2.cvtColor(bottom_ui, cv2.COLOR_BGR2GRAY), 50, 150)
+        
+        top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
+        bottom_edge_ratio = np.count_nonzero(bottom_edges) / bottom_edges.size
+        
+        if top_edge_ratio > 0.03 and bottom_edge_ratio > 0.03:
+            return ScreenState.IN_GAME
+        
+        # Лобби: меньше движения, характерные цвета Fortnite
+        if top_edge_ratio > 0.01 or bottom_edge_ratio > 0.02:
+            return ScreenState.LOBBY
+    
+    # 6. Проверяем меню/диалог (центральное окно на затемнённом фоне)
+    center_roi = img[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
+    center_bright = np.mean(cv2.cvtColor(center_roi, cv2.COLOR_BGR2GRAY))
+    edge_bright = (np.mean(gray[:int(h*0.2), :]) + np.mean(gray[int(h*0.8):, :])) / 2
+    
+    if center_bright > edge_bright * 1.5 and center_bright > 80:
+        # Яркий центр на тёмном фоне - вероятно диалог/меню
+        return ScreenState.MENU
+    
+    # 7. Проверяем ошибку (красные элементы, предупреждения)
+    red_lower1 = np.array([0, 100, 100], dtype=np.uint8)
+    red_upper1 = np.array([10, 255, 255], dtype=np.uint8)
+    red_lower2 = np.array([170, 100, 100], dtype=np.uint8)
+    red_upper2 = np.array([180, 255, 255], dtype=np.uint8)
+    mask_red = cv2.bitwise_or(
+        cv2.inRange(hsv, red_lower1, red_upper1),
+        cv2.inRange(hsv, red_lower2, red_upper2)
+    )
+    
+    if np.count_nonzero(mask_red) / mask_red.size > 0.01:
+        # Много красного - возможно ошибка
+        return ScreenState.ERROR
+    
+    return ScreenState.UNKNOWN
+
+
+def wait_for_screen_state(
+    page_or_img_source,
+    target_states: Union[ScreenState, List[ScreenState]],
+    timeout: float = 30.0,
+    poll_interval: float = 0.5
+) -> Optional[ScreenState]:
+    """
+    Ожидает появления одного из целевых состояний экрана.
+    
+    Args:
+        page_or_img_source: Playwright page или callable возвращающий изображение
+        target_states: Одно или несколько ожидаемых состояний
+        timeout: Максимальное время ожидания
+        poll_interval: Интервал проверки
+    
+    Returns:
+        ScreenState если достигнуто, None если таймаут
+    """
+    if isinstance(target_states, ScreenState):
+        target_states = [target_states]
+    
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            if callable(page_or_img_source):
+                img = page_or_img_source()
+            elif hasattr(page_or_img_source, 'screenshot'):
+                img = _capture_page_bgr(page_or_img_source)
+            else:
+                img = page_or_img_source
+            
+            state = detect_screen_state(img, use_cache=False)
+            if state in target_states:
+                return state
+        except Exception:
+            pass
+        
+        time.sleep(poll_interval)
+    
+    return None
+
+
+def get_screen_state_info(page_or_img) -> Dict:
+    """
+    Возвращает детальную информацию о состоянии экрана.
+    
+    Returns:
+        Dict с ключами: state, brightness, contrast, has_ui, dominant_colors
+    """
+    try:
+        if hasattr(page_or_img, 'screenshot'):
+            img = _capture_page_bgr(page_or_img)
+        else:
+            img = page_or_img
+        
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # Базовые метрики
+        brightness = float(np.mean(gray))
+        contrast = float(np.std(gray))
+        
+        # Определяем доминантные цвета
+        # Упрощённо: берём средний цвет
+        avg_color = img.mean(axis=(0, 1)).astype(int)
+        
+        # Проверяем UI
+        top_edges = cv2.Canny(gray[:int(h*0.15), :], 50, 150)
+        bottom_edges = cv2.Canny(gray[int(h*0.85):, :], 50, 150)
+        has_ui = (
+            np.count_nonzero(top_edges) / top_edges.size > 0.02 or
+            np.count_nonzero(bottom_edges) / bottom_edges.size > 0.02
+        )
+        
+        # Состояние
+        state = detect_screen_state(img, use_cache=False)
+        
+        return {
+            "state": state.name,
+            "state_value": state.value,
+            "brightness": brightness,
+            "contrast": contrast,
+            "has_ui": has_ui,
+            "avg_color_bgr": tuple(avg_color.tolist()),
+            "width": w,
+            "height": h
+        }
+    except Exception as e:
+        return {
+            "state": ScreenState.UNKNOWN.name,
+            "error": str(e)
+        }

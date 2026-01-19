@@ -28,7 +28,19 @@ function startPython() {
   const projectRoot = path.resolve(__dirname, '..', '..')
   // Запускаем как модуль, чтобы пакет src.* корректно импортировался
   const env = { ...process.env, PYTHONUNBUFFERED: '1' }
+  
+  console.log(`[main] Starting Python: ${exe} -u -m src.ipc_server`)
+  console.log(`[main] CWD: ${projectRoot}`)
+  
   py = spawn(exe, ['-u', '-m', 'src.ipc_server'], { stdio: ['pipe', 'pipe', 'pipe'], cwd: projectRoot, env })
+  
+  py.on('error', (err) => {
+    console.error('[main] Failed to start Python process:', err)
+    const t = `[system:error] Failed to start Python: ${err.message}`
+    logBuffer += t + '\n'
+    win?.webContents.send('status-event', { event: 'status', login: 'system', text: t })
+  })
+  
   py.stdout.setEncoding('utf8')
   py.stderr.setEncoding('utf8')
   py.stdout.on('data', (chunk) => {
@@ -69,10 +81,19 @@ function startPython() {
 }
 
 function rpc(method, params) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    if (!py || py.killed) {
+      resolve({ error: 'Python process not running' })
+      return
+    }
     const id = ++reqId
     pending.set(id, { resolve })
-    py.stdin.write(JSON.stringify({ id, method, params }) + '\n')
+    try {
+      py.stdin.write(JSON.stringify({ id, method, params }) + '\n')
+    } catch (e) {
+      pending.delete(id)
+      resolve({ error: `Failed to send: ${e.message}` })
+    }
   })
 }
 

@@ -38,6 +38,8 @@ dist/
 chrome-profile/
 chromedriver-win64/
 .electron-user-data/
+electron-user-data/
+desktop/electron-user-data/
 
 # =============================================================================
 # СЕКРЕТЫ И КОНФИДЕНЦИАЛЬНЫЕ ДАННЫЕ - НИКОГДА НЕ КОММИТИТЬ!
@@ -63,3 +65,4 @@ config/yolo/
 *.db
 *.db-journal
 *.db-wal
+*.db-shm

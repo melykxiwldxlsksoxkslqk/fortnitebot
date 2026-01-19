@@ -1,6 +1,34 @@
 import React from 'react'
 import { useEffect, useState } from 'react'
-import { Button, Group, Title, Table, TextInput, Textarea, Modal } from '@mantine/core'
+import { 
+  Button, 
+  Group, 
+  Title, 
+  Table, 
+  TextInput, 
+  Textarea, 
+  Modal,
+  Paper,
+  Stack,
+  Box,
+  Text,
+  Badge,
+  ActionIcon,
+  Tooltip,
+  PasswordInput,
+  Alert
+} from '@mantine/core'
+import {
+  IconUsers,
+  IconPlus,
+  IconTrash,
+  IconDeviceFloppy,
+  IconRefresh,
+  IconUpload,
+  IconUser,
+  IconLock,
+  IconAlertCircle
+} from '@tabler/icons-react'
 
 declare global {
   interface Window { desktop: any }
@@ -12,6 +40,8 @@ export default function Accounts() {
   const [rows, setRows] = useState<Row[]>([])
   const [bulkOpen, setBulkOpen] = useState(false)
   const [bulkText, setBulkText] = useState('')
+  const [isSaving, setIsSaving] = useState(false)
+  const [showPasswords, setShowPasswords] = useState<{[key: number]: boolean}>({})
 
   const load = async () => {
     const r = await window.desktop.rpc('get_accounts', null)
@@ -20,17 +50,21 @@ export default function Accounts() {
   useEffect(() => { load() }, [])
 
   const save = async () => {
-    // фильтр пустых строк
-    const cleaned = rows.filter(r => (r.login || '').trim())
-    const res = await window.desktop.rpc('save_accounts', { accounts: cleaned })
-    await load()
+    setIsSaving(true)
+    try {
+      const cleaned = rows.filter(r => (r.login || '').trim())
+      await window.desktop.rpc('save_accounts', { accounts: cleaned })
+      await load()
+    } finally {
+      setIsSaving(false)
+    }
   }
+  
   const add = () => setRows([...rows, { login: '', password: '' }])
   const remove = (i: number) => setRows(rows.filter((_, idx) => idx !== i))
   const clearAll = () => setRows([])
 
   const applyBulk = () => {
-    // формат: login;password или login:password или "login password" по одному на строку
     const lines = bulkText.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
     const next: Row[] = [...rows]
     for (const ln of lines) {
@@ -42,62 +76,217 @@ export default function Accounts() {
       }
     }
     setRows(next)
-    setBulkOpen(false); setBulkText('')
+    setBulkOpen(false)
+    setBulkText('')
+  }
+
+  const togglePassword = (index: number) => {
+    setShowPasswords(prev => ({ ...prev, [index]: !prev[index] }))
   }
 
   return (
-    <div>
-      <Group justify="space-between" mb="md">
-        <Title order={3}>Аккаунты</Title>
-        <Group>
-          <Button onClick={() => setBulkOpen(true)}>Массовый ввод</Button>
-          <Button onClick={add}>Добавить</Button>
-          <Button onClick={save}>Сохранить</Button>
-          <Button variant="light" onClick={load}>Обновить</Button>
-          <Button color="gray" variant="light" onClick={clearAll}>Очистить</Button>
+    <Stack gap="lg">
+      {/* Header */}
+      <Paper p="md" radius="lg" withBorder>
+        <Group justify="space-between">
+          <Group gap="sm">
+            <Box className="section-header-icon">
+              <IconUsers size={18} />
+            </Box>
+            <div>
+              <Title order={4}>Аккаунты Epic Games</Title>
+              <Text size="sm" c="dimmed">Управление аккаунтами для ботов</Text>
+            </div>
+          </Group>
+          
+          <Group gap="xs">
+            <Tooltip label="Массовый импорт">
+              <Button 
+                leftSection={<IconUpload size={18} />}
+                variant="light" 
+                onClick={() => setBulkOpen(true)}
+              >
+                Импорт
+              </Button>
+            </Tooltip>
+            <Tooltip label="Добавить аккаунт">
+              <Button 
+                leftSection={<IconPlus size={18} />}
+                variant="light"
+                color="green"
+                onClick={add}
+              >
+                Добавить
+              </Button>
+            </Tooltip>
+            <Tooltip label="Сохранить изменения">
+              <Button 
+                leftSection={<IconDeviceFloppy size={18} />}
+                onClick={save}
+                loading={isSaving}
+              >
+                Сохранить
+              </Button>
+            </Tooltip>
+            <Tooltip label="Обновить">
+              <ActionIcon variant="light" size="lg" onClick={load}>
+                <IconRefresh size={18} />
+              </ActionIcon>
+            </Tooltip>
+            <Tooltip label="Очистить всё">
+              <ActionIcon variant="light" color="gray" size="lg" onClick={clearAll}>
+                <IconTrash size={18} />
+              </ActionIcon>
+            </Tooltip>
+          </Group>
         </Group>
+      </Paper>
+
+      {/* Stats */}
+      <Group gap="md">
+        <Badge size="lg" variant="light" color="violet" leftSection={<IconUsers size={14} />}>
+          {rows.length} аккаунт{rows.length === 1 ? '' : rows.length < 5 ? 'а' : 'ов'}
+        </Badge>
+        <Badge size="lg" variant="light" color="green" leftSection={<IconLock size={14} />}>
+          Пароли зашифрованы (AES-128)
+        </Badge>
       </Group>
 
-      <Table withTableBorder withColumnBorders>
-        <Table.Thead>
-          <Table.Tr>
-            <Table.Th>Логин</Table.Th>
-            <Table.Th>Пароль</Table.Th>
-            <Table.Th w={120}></Table.Th>
-          </Table.Tr>
-        </Table.Thead>
-        <Table.Tbody>
-          {rows.map((r, i) => (
-            <Table.Tr key={i}>
-              <Table.Td>
-                <TextInput value={r.login} onChange={(e) => {
-                  const v = [...rows]; v[i] = { ...v[i], login: e.currentTarget.value }; setRows(v)
-                }} />
-              </Table.Td>
-              <Table.Td>
-                <TextInput value={r.password} onChange={(e) => {
-                  const v = [...rows]; v[i] = { ...v[i], password: e.currentTarget.value }; setRows(v)
-                }} />
-              </Table.Td>
-              <Table.Td>
-                <Button color="red" variant="light" onClick={() => remove(i)}>Удалить</Button>
-              </Table.Td>
-            </Table.Tr>
-          ))}
-        </Table.Tbody>
-      </Table>
+      {/* Table */}
+      <Paper p="md" radius="lg" withBorder>
+        {rows.length === 0 ? (
+          <Box className="empty-state">
+            <IconUsers size={48} style={{ opacity: 0.3 }} />
+            <Text size="lg" fw={500} c="dimmed" mt="md">Нет аккаунтов</Text>
+            <Text size="sm" c="dimmed" mb="md">Добавьте аккаунты вручную или используйте массовый импорт</Text>
+            <Group gap="sm">
+              <Button leftSection={<IconPlus size={18} />} onClick={add}>
+                Добавить вручную
+              </Button>
+              <Button leftSection={<IconUpload size={18} />} variant="light" onClick={() => setBulkOpen(true)}>
+                Массовый импорт
+              </Button>
+            </Group>
+          </Box>
+        ) : (
+          <Table highlightOnHover withTableBorder withColumnBorders>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th style={{ width: 50 }}>#</Table.Th>
+                <Table.Th>
+                  <Group gap={6}>
+                    <IconUser size={16} />
+                    Логин / Email
+                  </Group>
+                </Table.Th>
+                <Table.Th>
+                  <Group gap={6}>
+                    <IconLock size={16} />
+                    Пароль
+                  </Group>
+                </Table.Th>
+                <Table.Th style={{ width: 80 }}>Действия</Table.Th>
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {rows.map((r, i) => (
+                <Table.Tr key={i}>
+                  <Table.Td>
+                    <Text size="sm" c="dimmed" fw={500}>{i + 1}</Text>
+                  </Table.Td>
+                  <Table.Td>
+                    <TextInput 
+                      value={r.login} 
+                      placeholder="email@example.com"
+                      onChange={(e) => {
+                        const v = [...rows]
+                        v[i] = { ...v[i], login: e.currentTarget.value }
+                        setRows(v)
+                      }}
+                      styles={{
+                        input: { border: 'none', background: 'transparent' }
+                      }}
+                    />
+                  </Table.Td>
+                  <Table.Td>
+                    <PasswordInput 
+                      value={r.password}
+                      placeholder="••••••••"
+                      visible={showPasswords[i]}
+                      onVisibilityChange={() => togglePassword(i)}
+                      onChange={(e) => {
+                        const v = [...rows]
+                        v[i] = { ...v[i], password: e.currentTarget.value }
+                        setRows(v)
+                      }}
+                      styles={{
+                        input: { border: 'none', background: 'transparent' }
+                      }}
+                    />
+                  </Table.Td>
+                  <Table.Td>
+                    <Tooltip label="Удалить">
+                      <ActionIcon 
+                        color="red" 
+                        variant="light" 
+                        onClick={() => remove(i)}
+                      >
+                        <IconTrash size={16} />
+                      </ActionIcon>
+                    </Tooltip>
+                  </Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+        )}
+      </Paper>
 
-      <Modal opened={bulkOpen} onClose={() => setBulkOpen(false)} title="Массовый ввод аккаунтов" centered>
-        <Textarea
-          placeholder="login1;password1\nlogin2;password2\n..."
-          minRows={10}
-          value={bulkText}
-          onChange={(e) => setBulkText(e.currentTarget.value)}
-        />
-        <Group justify="flex-end" mt="md">
-          <Button onClick={applyBulk}>Добавить</Button>
-        </Group>
+      {/* Bulk Import Modal */}
+      <Modal 
+        opened={bulkOpen} 
+        onClose={() => setBulkOpen(false)} 
+        title={
+          <Group gap="sm">
+            <IconUpload size={20} />
+            <Text fw={600}>Массовый импорт аккаунтов</Text>
+          </Group>
+        }
+        centered
+        size="lg"
+      >
+        <Stack gap="md">
+          <Alert icon={<IconAlertCircle size={16} />} color="blue" variant="light">
+            Поддерживаемые форматы: <br />
+            <code>login;password</code> или <code>login:password</code> или <code>login password</code>
+          </Alert>
+          
+          <Textarea
+            placeholder="user1@mail.com;password123&#10;user2@mail.com:pass456&#10;user3@mail.com mypassword"
+            minRows={12}
+            value={bulkText}
+            onChange={(e) => setBulkText(e.currentTarget.value)}
+            styles={{
+              input: {
+                fontFamily: 'var(--mantine-font-family-monospace)',
+              }
+            }}
+          />
+          
+          <Group justify="flex-end">
+            <Button variant="light" onClick={() => setBulkOpen(false)}>
+              Отмена
+            </Button>
+            <Button 
+              leftSection={<IconPlus size={18} />}
+              onClick={applyBulk}
+              disabled={!bulkText.trim()}
+            >
+              Добавить {bulkText.split('\n').filter(l => l.trim()).length} аккаунт(ов)
+            </Button>
+          </Group>
+        </Stack>
       </Modal>
-    </div>
+    </Stack>
   )
 } 

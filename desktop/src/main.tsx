@@ -1,8 +1,12 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { MantineProvider } from '@mantine/core'
+import { Notifications } from '@mantine/notifications'
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom'
 import '@mantine/core/styles.css'
+import '@mantine/notifications/styles.css'
+import './styles/global.css'
+import { theme } from './theme'
 import Dashboard from './screens/Dashboard'
 import Settings from './screens/Settings'
 import Logs from './screens/Logs'
@@ -13,7 +17,8 @@ import AppLayout from './components/AppLayout'
 
 function App() {
   return (
-    <MantineProvider defaultColorScheme="dark">
+    <MantineProvider theme={theme} defaultColorScheme="dark">
+      <Notifications position="top-right" />
       <HashRouter>
         <Routes>
           <Route path="/" element={<AppLayout />}> 

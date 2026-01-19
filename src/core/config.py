@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 # ПУТИ
 # ============================================================================
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CONFIG_DIR = os.path.join(ROOT_DIR, 'config')
 ASSETS_DIR = os.path.join(ROOT_DIR, 'assets')
 DEBUG_DIR = os.path.join(ROOT_DIR, 'debug')
@@ -224,40 +224,3 @@ def validate_email(email: str) -> bool:
     import re
     pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     return bool(re.match(pattern, email))
-
-
-# ============================================================================
-# ЗАГРУЗКА ПОЛЬЗОВАТЕЛЬСКОЙ КОНФИГУРАЦИИ
-# ============================================================================
-
-def load_user_config() -> Dict[str, Any]:
-    """
-    Загружает пользовательскую конфигурацию из БД.
-    Возвращает словарь с настройками или значения по умолчанию.
-    """
-    try:
-        from . import db as dbmod
-        dbmod.init_db()
-        settings = dbmod.get_settings() or {}
-        
-        # Нормализация типов
-        result = DEFAULT_SETTINGS.copy()
-        
-        for key, value in settings.items():
-            if key in ('time_on_island_min',):
-                try:
-                    result[key] = int(value)
-                except (ValueError, TypeError):
-                    pass
-            elif key in ('headless', 'invert_bg'):
-                if isinstance(value, bool):
-                    result[key] = value
-                else:
-                    s = str(value).strip().lower()
-                    result[key] = s in ('1', 'true', 'yes', 'on')
-            else:
-                result[key] = value
-        
-        return result
-    except Exception:
-        return DEFAULT_SETTINGS.copy()
