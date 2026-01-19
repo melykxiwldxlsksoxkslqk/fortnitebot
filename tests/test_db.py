@@ -10,8 +10,8 @@ import pytest
 # Добавляем путь к src
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src import db as dbmod
-from src.security import encrypt_password, decrypt_password, is_encrypted
+from src.core import db as dbmod
+from src.core.security import encrypt_password, decrypt_password, is_encrypted
 
 
 class TestDatabase:
