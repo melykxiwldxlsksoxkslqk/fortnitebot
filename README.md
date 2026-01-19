@@ -1,4 +1,4 @@
-# EpicBot - Cloud Gaming Bot v2.1
+# EpicBot - Cloud Gaming Bot v3.0
 
 🎮 Бот для автоматизации действий в играх через Xbox Cloud Gaming с использованием компьютерного зрения и машинного обучения.
 
@@ -10,26 +10,38 @@
 - **RL-агент** — Обучение с подкреплением через Stable-Baselines3 (опционально)
 - **Desktop GUI** — Современный Electron-интерфейс
 - **Мульти-аккаунт** — Поддержка нескольких аккаунтов с прокси
-- **🔒 Шифрование** — Безопасное хранение паролей (AES-128)
+- **🔒 Шифрование** — Безопасное хранение паролей (Fernet AES)
 
 ## 📁 Структура проекта
 
 ```
 fortnitebot/
 ├── src/                    # Исходный код Python
-│   ├── __init__.py         # Экспорт модулей
-│   ├── bot_logic.py        # Логика бота и RL-среда
-│   ├── browser.py          # Playwright + Camoufox
-│   ├── config.py           # Конфигурация и константы
-│   ├── db.py               # Работа с SQLite
-│   ├── logger.py           # Централизованное логирование
-│   ├── main.py             # Точка входа
-│   ├── security.py         # Шифрование паролей
-│   ├── stream_input.py     # Управление вводом
-│   └── vision.py           # Компьютерное зрение
+│   ├── core/               # 🔧 Базовые компоненты
+│   │   ├── config.py       # Конфигурация и константы
+│   │   ├── db.py           # Работа с SQLite
+│   │   ├── logger.py       # Централизованное логирование
+│   │   ├── security.py     # Шифрование паролей
+│   │   └── exceptions.py   # Исключения
+│   ├── vision/             # 👁️ Компьютерное зрение
+│   │   ├── capture.py      # Захват экрана/страницы
+│   │   ├── detection.py    # Поиск шаблонов
+│   │   ├── state.py        # ScreenState enum
+│   │   ├── templates.py    # Кэширование шаблонов
+│   │   └── yolo_detector.py # YOLO детекция
+│   ├── browser/            # 🌐 Браузерная автоматизация
+│   │   ├── manager.py      # BrowserManager (Camoufox/Playwright)
+│   │   └── input.py        # Эмуляция ввода
+│   ├── bot/                # 🤖 Логика бота
+│   │   ├── logic.py        # BotLogic класс
+│   │   └── runner.py       # BotRunner, run_bot()
+│   ├── ipc/                # 📡 IPC для Electron
+│   │   └── server.py       # JSON-RPC сервер
+│   ├── main.py             # Точка входа (legacy)
+│   └── run.py              # Новая точка входа
 ├── desktop/                # Electron GUI
-├── tests/                  # Unit-тесты
-├── config/                 # Конфигурационные файлы
+├── tests/                  # Unit-тесты (48 тестов)
+├── config/                 # Конфигурация (БД, настройки)
 ├── assets/                 # Шаблоны изображений
 ├── logs/                   # Логи (автоматически)
 ├── requirements.txt        # Основные зависимости
@@ -79,19 +91,24 @@ pip install -r requirements-ml.txt
 
 ## ⚙️ Использование
 
-### GUI
+### GUI (Electron)
 ```bash
 python start_desktop.py
 ```
 
 ### CLI
 ```bash
-python -m src.main
+python -m src.run --cli
+```
+
+### IPC Server (для Electron)
+```bash
+python -m src.run
 ```
 
 ### Тесты
 ```bash
-pytest
+pytest tests/ -v
 ```
 
 ## 🔒 Безопасность

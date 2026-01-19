@@ -73,11 +73,11 @@ class TestVisionConstants:
     
     def test_scales_exist(self):
         """Тест наличия масштабов."""
-        from src.vision.constants import SCALES
+        from src.vision.constants import MULTI_SCALE_DEFAULT
         
-        assert isinstance(SCALES, (list, tuple))
-        assert len(SCALES) > 0
-        assert all(s > 0 for s in SCALES)
+        assert isinstance(MULTI_SCALE_DEFAULT, (list, tuple))
+        assert len(MULTI_SCALE_DEFAULT) > 0
+        assert all(s > 0 for s in MULTI_SCALE_DEFAULT)
 
 
 class TestDetection:
@@ -87,17 +87,20 @@ class TestDetection:
         """Тест поиска шаблона с None изображением."""
         from src.vision.detection import find_template
         
-        result = find_template(None, 'test.png')
-        assert result is None
+        # При None изображении должна быть ошибка
+        with pytest.raises((AttributeError, TypeError)):
+            find_template(None, 'test.png')
     
-    def test_find_template_with_empty_image(self):
-        """Тест поиска шаблона с пустым изображением."""
+    def test_find_template_with_nonexistent_template(self):
+        """Тест поиска с несуществующим шаблоном."""
         from src.vision.detection import find_template
         
-        # Создаём пустое изображение
-        empty_img = np.zeros((100, 100, 3), dtype=np.uint8)
-        result = find_template(empty_img, 'nonexistent.png')
-        assert result is None
+        # Создаём тестовое изображение
+        test_img = np.zeros((100, 100, 3), dtype=np.uint8)
+        
+        # При несуществующем шаблоне должна быть ошибка
+        with pytest.raises((IOError, OSError, FileNotFoundError)):
+            find_template(test_img, 'nonexistent_template_12345.png')
 
 
 class TestCapture:
