@@ -8,16 +8,25 @@ __pycache__/
 venv/
 env/
 *.log
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+.coverage
+htmlcov/
 
 # Editors/OS
 .idea/
+.vscode/
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
 
 # Node/Electron
 desktop/node_modules/
 third_party/**/node_modules/
 *.asar
+desktop/dist/
 
 # Builds/Artifacts
 build/
@@ -26,9 +35,31 @@ dist/
 *.tmp
 
 # Browser/Drivers/Cache
+chrome-profile/
+chromedriver-win64/
+.electron-user-data/
 
+# =============================================================================
+# СЕКРЕТЫ И КОНФИДЕНЦИАЛЬНЫЕ ДАННЫЕ - НИКОГДА НЕ КОММИТИТЬ!
+# =============================================================================
+config/accounts.txt
+config/bulk_accounts.txt
+config/bulk_proxies.txt
+config/settings.json
+config/epicbot.db
+config/.secret_key
 
+# Логи
+logs/
+debug/*.png
+
+# YOLO модели (тяжёлые файлы)
+config/yolo/
+*.pt
+*.onnx
 
 # Misc
 *.sqlite*
-*.db 
+*.db
+*.db-journal
+*.db-wal
