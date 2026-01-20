@@ -29,10 +29,10 @@ function startPython() {
   // Запускаем как модуль, чтобы пакет src.* корректно импортировался
   const env = { ...process.env, PYTHONUNBUFFERED: '1' }
   
-  console.log(`[main] Starting Python: ${exe} -u -m src.ipc_server`)
+  console.log(`[main] Starting Python: ${exe} -u -m src.ipc`)
   console.log(`[main] CWD: ${projectRoot}`)
   
-  py = spawn(exe, ['-u', '-m', 'src.ipc_server'], { stdio: ['pipe', 'pipe', 'pipe'], cwd: projectRoot, env })
+  py = spawn(exe, ['-u', '-m', 'src.ipc'], { stdio: ['pipe', 'pipe', 'pipe'], cwd: projectRoot, env })
   
   py.on('error', (err) => {
     console.error('[main] Failed to start Python process:', err)

@@ -72,7 +72,14 @@ def setup_logging(
     
     # Консольный вывод
     if log_to_console:
-        console_handler = logging.StreamHandler(sys.stdout)
+        # На Windows нужно использовать UTF-8 для поддержки всех символов
+        try:
+            import io
+            console_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        except Exception:
+            console_stream = sys.stdout
+        
+        console_handler = logging.StreamHandler(console_stream)
         console_handler.setFormatter(formatter)
         console_handler.setLevel(LOG_LEVELS.get(level.upper(), logging.INFO))
         logger.addHandler(console_handler)

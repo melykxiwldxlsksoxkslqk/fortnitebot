@@ -19,6 +19,7 @@ class ScreenState(Enum):
     PLANE_SCREEN = auto()      # Зелёный самолёт Xbox
     XBOX_LOADING = auto()      # Xbox Cloud Gaming загрузка
     LOGIN_PAGE = auto()        # Страница входа
+    TITLE_SCREEN = auto()      # Титульный экран Fortnite (нажми любую клавишу)
     LOBBY = auto()             # Лобби Fortnite
     IN_GAME = auto()           # В игре
     MENU = auto()              # Меню/настройки
@@ -38,9 +39,28 @@ def _get_image(page_or_img) -> np.ndarray:
 
 
 def _detect_connecting_overlay(img: np.ndarray) -> bool:
-    """Детектирует оверлей CONNECTING на изображении."""
+    """
+    Детектирует оверлей CONNECTING/LOGGING IN на изображении.
+    
+    Этот оверлей появляется когда Xbox Cloud Gaming подключается к серверу.
+    Характеристики: тёмный/полупрозрачный фон с текстом CONNECTING или спиннером.
+    """
     try:
         h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Главная страница Xbox обычно яркая (белый фон, много контента)
+        # CONNECTING оверлей обычно тёмный
+        mean_brightness = np.mean(gray)
+        
+        # Если экран слишком яркий - это не CONNECTING
+        if mean_brightness > 120:
+            return False
+        
+        # Проверяем что основная часть экрана тёмная (оверлей)
+        dark_pixels = np.sum(gray < 50) / gray.size
+        if dark_pixels < 0.3:  # Минимум 30% тёмных пикселей
+            return False
         
         def roi_abs(fr):
             x0 = max(0, min(w - 1, int(w * fr[0])))
@@ -49,46 +69,52 @@ def _detect_connecting_overlay(img: np.ndarray) -> bool:
             y1 = max(0, min(h, int(h * fr[3])))
             return x0, y0, x1, y1
         
-        # Расширенные зоны поиска
+        # Зоны поиска текста CONNECTING (обычно в центре или внизу)
         rois = [
-            (0.00, 0.80, 0.50, 0.99),  # левый-низ
-            (0.25, 0.70, 0.75, 0.95),  # центр-низ
-            (0.00, 0.70, 1.00, 0.99),  # весь низ
-            (0.30, 0.40, 0.70, 0.60),  # центр экрана (loading spinner)
+            (0.25, 0.40, 0.75, 0.65),  # центр экрана
+            (0.20, 0.75, 0.80, 0.95),  # нижняя часть
         ]
         
-        # Циан/бирюза в HSV — широкий диапазон
-        cyan_lower = np.array([60, 40, 100], dtype=np.uint8)
-        cyan_upper = np.array([130, 255, 255], dtype=np.uint8)
-        
-        # Белый текст (тоже часто используется)
-        white_lower = np.array([0, 0, 200], dtype=np.uint8)
-        white_upper = np.array([180, 40, 255], dtype=np.uint8)
+        # Циан/бирюза CONNECTING текста
+        cyan_lower = np.array([80, 80, 120], dtype=np.uint8)
+        cyan_upper = np.array([110, 255, 255], dtype=np.uint8)
         
         for fr in rois:
             x0, y0, x1, y1 = roi_abs(fr)
             if x1 <= x0 or y1 <= y0:
                 continue
             roi = img[y0:y1, x0:x1]
+            roi_gray = gray[y0:y1, x0:x1]
+            
+            # ROI тоже должен быть тёмным
+            if np.mean(roi_gray) > 80:
+                continue
+                
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             
-            # Проверяем циановые пиксели
+            # Проверяем циановые пиксели (текст CONNECTING)
             mask_cyan = cv2.inRange(hsv, cyan_lower, cyan_upper)
             mask_cyan = cv2.medianBlur(mask_cyan, 3)
-            kernel = np.ones((3, 3), np.uint8)
-            mask_cyan = cv2.morphologyEx(mask_cyan, cv2.MORPH_CLOSE, kernel, iterations=1)
             
             ratio_cyan = float(np.count_nonzero(mask_cyan)) / float(mask_cyan.size)
-            if ratio_cyan > 0.002:
+            # Должно быть немного циановых пикселей (текст), но не слишком много
+            if 0.005 < ratio_cyan < 0.15:
                 return True
-            
-            # Проверяем белый текст на тёмном фоне
-            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            mean_bright = np.mean(gray)
-            if mean_bright < 60:
-                mask_white = cv2.inRange(hsv, white_lower, white_upper)
-                ratio_white = float(np.count_nonzero(mask_white)) / float(mask_white.size)
-                if ratio_white > 0.01:
+        
+        # Проверяем наличие спиннера загрузки в центре
+        cx, cy = w // 2, h // 2
+        spinner_roi = img[cy - 50:cy + 50, cx - 50:cx + 50] if cy > 50 and cx > 50 else None
+        if spinner_roi is not None and spinner_roi.size > 0:
+            spinner_gray = cv2.cvtColor(spinner_roi, cv2.COLOR_BGR2GRAY)
+            # Спиннер обычно имеет круговую структуру
+            circles = cv2.HoughCircles(
+                spinner_gray, cv2.HOUGH_GRADIENT, 1, 20,
+                param1=50, param2=25,
+                minRadius=10, maxRadius=40
+            )
+            if circles is not None and len(circles[0]) > 0:
+                # Проверяем что фон тёмный
+                if np.mean(spinner_gray) < 60:
                     return True
         
         return False
@@ -129,6 +155,58 @@ def _detect_plane_screen(img: np.ndarray) -> bool:
         edges = cv2.Canny(gray[y0:y1, x0:x1], 50, 150)
         lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, minLineLength=50, maxLineGap=10)
         if lines is not None and len(lines) > 3:
+            return True
+        
+        return False
+    except Exception:
+        return False
+
+
+def _detect_title_screen(img: np.ndarray) -> bool:
+    """
+    Детектирует титульный экран Fortnite.
+    
+    Характеристики:
+    - Яркое изображение (не тёмный экран загрузки)
+    - Много фиолетовых/пурпурных тонов (типичная цветовая схема Fortnite)
+    - Возможно надпись FORTNITE в верхней части (белая)
+    """
+    try:
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        mean_brightness = np.mean(gray)
+        
+        # Титульный экран яркий (не тёмная загрузка)
+        if mean_brightness < 60:
+            return False
+        
+        # Проверяем наличие фиолетовых/пурпурных тонов (характерно для Fortnite)
+        # Фиолетовый в HSV: H=125-155, высокая насыщенность
+        purple_lower = np.array([120, 30, 50], dtype=np.uint8)
+        purple_upper = np.array([165, 255, 255], dtype=np.uint8)
+        mask_purple = cv2.inRange(hsv, purple_lower, purple_upper)
+        purple_ratio = np.count_nonzero(mask_purple) / mask_purple.size
+        
+        # Если много фиолетового - скорее всего титульный экран Fortnite
+        if purple_ratio > 0.05:
+            return True
+        
+        # Также проверяем на яркие разноцветные области (персонажи, эффекты)
+        # Высокая насыщенность и яркость
+        colorful_lower = np.array([0, 80, 100], dtype=np.uint8)
+        colorful_upper = np.array([180, 255, 255], dtype=np.uint8)
+        mask_colorful = cv2.inRange(hsv, colorful_lower, colorful_upper)
+        colorful_ratio = np.count_nonzero(mask_colorful) / mask_colorful.size
+        
+        # Проверяем верхнюю часть экрана на наличие белого текста (FORTNITE)
+        top_roi = img[0:int(h*0.25), int(w*0.2):int(w*0.8)]
+        top_gray = cv2.cvtColor(top_roi, cv2.COLOR_BGR2GRAY)
+        white_pixels = np.sum(top_gray > 200) / top_gray.size
+        
+        # Комбинация: много цветного + белый текст сверху
+        if colorful_ratio > 0.2 and white_pixels > 0.02:
             return True
         
         return False
@@ -257,8 +335,8 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     mean_brightness = np.mean(gray)
     std_brightness = np.std(gray)
     
-    # 1. CONNECTING оверлей
-    if _detect_connecting_overlay(img):
+    # 1. CONNECTING оверлей (только на тёмном фоне)
+    if mean_brightness < 100 and _detect_connecting_overlay(img):
         return ScreenState.CONNECTING
     
     # 2. Plane screen
@@ -276,7 +354,12 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         if std_brightness < 30:
             return ScreenState.LOADING
     
-    # 4. Страница входа
+    # 4. Титульный экран Fortnite (яркий, фиолетовый, с персонажами)
+    if _detect_title_screen(img):
+        return ScreenState.TITLE_SCREEN
+    
+    # 5. Страница входа Microsoft (белый фон с синими элементами)
+    # НЕ путать с Xbox Cloud Gaming страницей которая тоже яркая!
     white_lower = np.array([0, 0, 200], dtype=np.uint8)
     white_upper = np.array([180, 30, 255], dtype=np.uint8)
     mask_white = cv2.inRange(hsv, white_lower, white_upper)
@@ -286,10 +369,12 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         blue_lower = np.array([100, 50, 50], dtype=np.uint8)
         blue_upper = np.array([130, 255, 255], dtype=np.uint8)
         mask_blue = cv2.inRange(hsv, blue_lower, blue_upper)
-        if np.count_nonzero(mask_blue) / mask_blue.size > 0.005:
+        blue_ratio = np.count_nonzero(mask_blue) / mask_blue.size
+        # Только если много белого И есть синий - это Microsoft login
+        if blue_ratio > 0.01:
             return ScreenState.LOGIN_PAGE
     
-    # 5. Игровой экран
+    # 6. Игровой экран (Fortnite лобби или в игре)
     if std_brightness > 40:
         top_ui = img[0:int(h*0.12), :]
         bottom_ui = img[int(h*0.85):, :]
@@ -306,7 +391,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         if top_edge_ratio > 0.01 or bottom_edge_ratio > 0.02:
             return ScreenState.LOBBY
     
-    # 6. Меню/диалог
+    # 7. Меню/диалог
     center_roi = img[int(h*0.25):int(h*0.75), int(w*0.25):int(w*0.75)]
     center_bright = np.mean(cv2.cvtColor(center_roi, cv2.COLOR_BGR2GRAY))
     edge_bright = (np.mean(gray[:int(h*0.2), :]) + np.mean(gray[int(h*0.8):, :])) / 2
@@ -314,7 +399,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     if center_bright > edge_bright * 1.5 and center_bright > 80:
         return ScreenState.MENU
     
-    # 7. Ошибка
+    # 8. Ошибка
     red_lower1 = np.array([0, 100, 100], dtype=np.uint8)
     red_upper1 = np.array([10, 255, 255], dtype=np.uint8)
     red_lower2 = np.array([170, 100, 100], dtype=np.uint8)

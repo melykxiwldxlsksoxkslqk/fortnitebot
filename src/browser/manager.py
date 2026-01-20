@@ -76,24 +76,45 @@ def create_browser_camoufox(
     
     logger.info("Запуск Camoufox браузера...")
     
-    config = CAMOUFOX_CONFIG.copy()
+    # Camoufox launch options
+    launch_options = {
+        'headless': headless,
+        'geoip': True,
+        'humanize': True,
+    }
     
     if proxy and proxy.get('server'):
-        config['proxy'] = {'server': proxy['server']}
+        launch_options['proxy'] = {'server': proxy['server']}
         if proxy.get('username'):
-            config['proxy']['username'] = proxy['username']
+            launch_options['proxy']['username'] = proxy['username']
         if proxy.get('password'):
-            config['proxy']['password'] = proxy['password']
+            launch_options['proxy']['password'] = proxy['password']
     
+    # Используем persistent context для сохранения сессии
     if profile_dir:
         os.makedirs(profile_dir, exist_ok=True)
-        config['persistent_context'] = profile_dir
+        launch_options['persistent_context'] = True
+        launch_options['user_data_dir'] = profile_dir
     
     try:
-        cf = Camoufox(headless=headless, **config)
-        page = cf.new_page()
+        # Camoufox - это context manager, нужно вызвать __enter__
+        cf = Camoufox(**launch_options)
+        context = cf.__enter__()  # Возвращает Browser или BrowserContext
+        
+        # Получаем страницу
+        if hasattr(context, 'pages') and context.pages:
+            page = context.pages[0]
+        elif hasattr(context, 'new_page'):
+            page = context.new_page()
+        else:
+            # context может быть Browser, тогда создаём контекст
+            browser_context = context.new_context()
+            page = browser_context.new_page()
+            context = browser_context
+        
         logger.info("Camoufox браузер запущен")
-        return cf, cf, page
+        # Возвращаем cf как browser (для закрытия), context и page
+        return cf, context, page
     except Exception as e:
         logger.error(f"Ошибка запуска Camoufox: {e}")
         raise
@@ -216,7 +237,11 @@ def close_browser(browser, context=None, page=None) -> None:
                 pass
         if browser:
             try:
-                browser.close()
+                # Проверяем, является ли browser объектом Camoufox (context manager)
+                if hasattr(browser, '__exit__'):
+                    browser.__exit__(None, None, None)
+                else:
+                    browser.close()
             except Exception:
                 pass
         logger.debug("Браузер закрыт")
@@ -273,8 +298,9 @@ class BrowserManager:
     
     def new_page(self) -> "Page":
         """Создаёт новую страницу."""
-        if self._is_camoufox:
-            return self.browser.new_page()
+        # Для Camoufox context - это BrowserContext
+        if self.context and hasattr(self.context, 'new_page'):
+            return self.context.new_page()
         return self.context.new_page()
     
     def goto(self, url: str, **kwargs) -> None:

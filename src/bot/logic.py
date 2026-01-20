@@ -42,6 +42,7 @@ class BotLogic:
         self.update_status = update_status_callback
         self.playwright = None
         self.browser = None
+        self._runner = None  # Ссылка на BotRunner для принудительного закрытия
         self.stop_requested = False
         self.manual_lobby_event = threading.Event()
         
@@ -74,6 +75,21 @@ class BotLogic:
         """Запрашивает остановку бота."""
         self.stop_requested = True
         self._log("Получен запрос на остановку...")
+        
+        # Принудительно закрываем браузер если есть runner
+        if self._runner:
+            try:
+                self._runner._close_browser()
+            except Exception:
+                pass
+
+    def _is_stop_requested(self) -> bool:
+        """Возвращает True если запрошена остановка."""
+        return self.stop_requested
+    
+    def _set_runner(self, runner) -> None:
+        """Сохраняет ссылку на runner для принудительного закрытия."""
+        self._runner = runner
 
     async def run(self):
         """Запускает бота."""
@@ -97,7 +113,9 @@ class BotLogic:
                     headless, 
                     self.proxy, 
                     self.manual_lobby_event, 
-                    _forward
+                    _forward,
+                    self._is_stop_requested,  # передаём функцию проверки остановки
+                    self._set_runner  # передаём колбэк для сохранения runner
                 )
             except BadCredentialsError:
                 if self.update_status:
@@ -123,4 +141,5 @@ class BotLogic:
             if self.update_status:
                 self.update_status(self._login, f"Ошибка: {e.__class__.__name__}")
         finally:
+            self._runner = None
             self._log("Бот выключается.")
