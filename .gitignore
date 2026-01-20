@@ -37,6 +37,8 @@ dist/
 # Browser/Drivers/Cache
 chrome-profile/
 chromedriver-win64/
+browser-profile/
+browser-profiles/
 .electron-user-data/
 electron-user-data/
 desktop/electron-user-data/
