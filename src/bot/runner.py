@@ -97,6 +97,12 @@ class BotRunner:
             
             self._log("Запуск браузера...")
             
+            # Включаем debug режим vision сразу
+            try:
+                vision.set_vision_debug(True)
+            except Exception:
+                pass
+            
             # Создаём уникальный профиль для аккаунта (для сохранения сессии)
             import os
             import re
@@ -109,6 +115,8 @@ class BotRunner:
                 headless=self.headless,
                 proxy=self.proxy,
                 profile_dir=profile_dir,
+                prefer_camoufox=False,  # Не используем Camoufox
+                browser_type='chrome',  # Настоящий Google Chrome
             )
             
             if self._should_stop():
@@ -1072,6 +1080,7 @@ class BotRunner:
                 
                 # Пробуем найти кнопку по роли - это надёжнее чем по тексту
                 # Ищем кнопку (не ссылку!) с текстом Hrát/Play
+                
                 try:
                     play_btn = self.page.get_by_role("button", name="Hrát")
                     if play_btn.count() > 0 and play_btn.first.is_visible():
@@ -1133,6 +1142,13 @@ class BotRunner:
         # Включаем debug логирование vision
         try:
             vision.set_vision_debug(True)
+        except Exception:
+            pass
+        
+        # Пробуем сделать fullscreen
+        try:
+            self.page.keyboard.press('F11')
+            self._log("Нажат F11 для полноэкранного режима")
         except Exception:
             pass
         
@@ -1198,8 +1214,26 @@ class BotRunner:
                     if int(time.time()) % 30 == 0:
                         self._log(f"[DEBUG] URL: {current_url[:80]}")
                     
-                    # Если мы на главной странице xbox.com/play (без /games/fortnite) - игра закрылась!
-                    if "xbox.com" in current_url and "/play" in current_url and "/games/" not in current_url:
+                    # Проверяем что игра НЕ закрылась
+                    # Игра активна если URL содержит:
+                    # - /play/games/fortnite (страница игры)
+                    # - /play/launch/fortnite (запуск игры - ИГРА ЗАГРУЖАЕТСЯ!)
+                    # Игра закрылась если URL:
+                    # - просто /play или /play/ без fortnite
+                    
+                    is_game_active = (
+                        "fortnite" in current_url or 
+                        "/games/" in current_url or 
+                        "/launch/" in current_url
+                    )
+                    
+                    is_main_page = (
+                        "xbox.com" in current_url and 
+                        "/play" in current_url and 
+                        not is_game_active
+                    )
+                    
+                    if is_main_page:
                         self._log("ВНИМАНИЕ: Игра закрылась! Xbox вернул на главную страницу.")
                         self._log(f"URL: {current_url}")
                         self._log("Пробуем перезапустить игру...")

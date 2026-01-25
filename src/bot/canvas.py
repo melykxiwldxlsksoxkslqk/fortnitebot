@@ -289,8 +289,11 @@ class CanvasNavigator:
             self.page.mouse.click(cx, cy)
             self.page.wait_for_timeout(100)
             
-            # Проверяем что элемент активен
-            self.page.keyboard.press('F13')  # Neutral key
+            # Нажимаем Tab для активации фокуса (вместо F13 который не поддерживается)
+            try:
+                self.page.keyboard.press('Tab')
+            except Exception:
+                pass
             
             self._log_action(f"focus_canvas({cx}, {cy})")
             return True

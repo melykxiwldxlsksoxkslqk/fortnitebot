@@ -76,6 +76,18 @@ def create_browser_camoufox(
     
     logger.info("Запуск Camoufox браузера...")
     
+    # Получаем размер экрана через ctypes (Windows)
+    screen_width = 1920
+    screen_height = 1080
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        screen_width = user32.GetSystemMetrics(0)
+        screen_height = user32.GetSystemMetrics(1)
+        logger.info(f"Размер экрана: {screen_width}x{screen_height}")
+    except Exception as e:
+        logger.debug(f"Не удалось получить размер экрана: {e}")
+    
     # Camoufox launch options
     launch_options = {
         'headless': headless,
@@ -114,12 +126,11 @@ def create_browser_camoufox(
         
         # Максимизируем окно браузера
         try:
-            # Получаем размер экрана и устанавливаем viewport
-            screen_size = page.evaluate("() => ({ width: window.screen.availWidth, height: window.screen.availHeight })")
-            page.set_viewport_size({"width": screen_size["width"], "height": screen_size["height"]})
-            logger.debug(f"Viewport установлен: {screen_size['width']}x{screen_size['height']}")
+            # Устанавливаем viewport на размер экрана
+            page.set_viewport_size({"width": screen_width, "height": screen_height})
+            logger.info(f"Viewport установлен: {screen_width}x{screen_height}")
         except Exception as e:
-            logger.debug(f"Не удалось максимизировать окно: {e}")
+            logger.debug(f"Не удалось установить viewport: {e}")
         
         logger.info("Camoufox браузер запущен")
         # Возвращаем cf как browser (для закрытия), context и page
@@ -144,7 +155,42 @@ def create_browser_playwright(
     
     pw = sync_playwright().start()
     
-    if browser_type == 'firefox':
+    # Определяем движок и путь к браузеру
+    executable_path = None
+    
+    if browser_type == 'opera':
+        # Opera - ищем исполняемый файл
+        engine = pw.chromium
+        possible_paths = [
+            r"C:\Users\Administrator\AppData\Local\Programs\Opera\opera.exe",
+            r"C:\Program Files\Opera\opera.exe",
+            r"C:\Program Files (x86)\Opera\opera.exe",
+            r"C:\Users\Administrator\AppData\Local\Programs\Opera GX\opera.exe",
+            r"C:\Program Files\Opera GX\opera.exe",
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                executable_path = path
+                logger.info(f"Найдена Opera: {path}")
+                break
+        if not executable_path:
+            logger.warning("Opera не найдена, используем Chromium")
+    elif browser_type == 'chrome':
+        # Google Chrome - ищем исполняемый файл
+        engine = pw.chromium
+        possible_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Users\Administrator\AppData\Local\Google\Chrome\Application\chrome.exe",
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                executable_path = path
+                logger.info(f"Найден Google Chrome: {path}")
+                break
+        if not executable_path:
+            logger.warning("Google Chrome не найден, используем Chromium")
+    elif browser_type == 'firefox':
         engine = pw.firefox
     elif browser_type == 'webkit':
         engine = pw.webkit
@@ -153,7 +199,10 @@ def create_browser_playwright(
     
     launch_kwargs: Dict[str, Any] = {'headless': headless}
     
-    if browser_type == 'chromium':
+    if executable_path:
+        launch_kwargs['executable_path'] = executable_path
+    
+    if browser_type in ('chromium', 'opera'):
         args = CHROMIUM_ARGS.copy()
         if extensions:
             valid_extensions = [e for e in extensions if os.path.exists(e)]
