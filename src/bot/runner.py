@@ -1127,7 +1127,7 @@ class BotRunner:
             return False
     
     def _wait_for_game(self) -> bool:
-        """Ожидает загрузки игры и ручного сигнала о готовности лобби."""
+        """Ожидает загрузки игры и ручного сигнала о готовности лобби (с автодетекцией)."""
         self._log("Ожидание загрузки игры и сигнала 'Лобби готово'...")
         
         # Включаем debug логирование vision
@@ -1142,8 +1142,12 @@ class BotRunner:
         controller_dialog_checked = 0
         play_retry_count = 0  # Счётчик повторных попыток нажать Play
         last_log_time = 0
+        lobby_detected_count = 0  # Счётчик последовательных обнаружений лобби
+        search_icon_check_interval = 5  # Проверять иконку поиска каждые 5 секунд
+        last_search_icon_check = 0
         
         self._log("Нажмите кнопку 'Лобби готово' в UI когда персонаж появится в лобби")
+        self._log("(Также бот автоматически обнаружит лобби по иконке поиска)")
         
         while time.time() - start < timeout:
             # Проверяем остановку
@@ -1186,12 +1190,18 @@ class BotRunner:
                     pass
             
             try:
-                # ВАЖНО: Проверяем не вернулись ли мы на главную страницу Xbox (игра закрылась)
+                # ВАЖНО: Проверяем URL - логируем для отладки
                 try:
                     current_url = self.page.url.lower()
+                    
+                    # Логируем URL каждые 30 секунд для отладки
+                    if int(time.time()) % 30 == 0:
+                        self._log(f"[DEBUG] URL: {current_url[:80]}")
+                    
                     # Если мы на главной странице xbox.com/play (без /games/fortnite) - игра закрылась!
-                    if "xbox.com/play" in current_url and "/games/" not in current_url:
+                    if "xbox.com" in current_url and "/play" in current_url and "/games/" not in current_url:
                         self._log("ВНИМАНИЕ: Игра закрылась! Xbox вернул на главную страницу.")
+                        self._log(f"URL: {current_url}")
                         self._log("Пробуем перезапустить игру...")
                         
                         # Пробуем перезапустить Fortnite
@@ -1214,8 +1224,8 @@ class BotRunner:
                         controller_dialog_checked = 0
                         play_retry_count = 0
                         continue
-                except Exception:
-                    pass
+                except Exception as url_err:
+                    self._log(f"[DEBUG] Ошибка проверки URL: {url_err}")
                 
                 # Проверяем состояние экрана для логирования
                 state = vision.detect_screen_state(self.page)
@@ -1240,6 +1250,32 @@ class BotRunner:
                     self.page.keyboard.press('Enter')
                     time.sleep(3)
                     continue
+                
+                # АВТОДЕТЕКЦИЯ ЛОББИ: если состояние LOBBY, проверяем иконку поиска
+                if state == vision.ScreenState.LOBBY:
+                    # Проверяем иконку поиска каждые N секунд для надёжности
+                    if current_time - last_search_icon_check >= search_icon_check_interval:
+                        last_search_icon_check = current_time
+                        try:
+                            search_icon_result = vision.find_search_icon(self.page)
+                            if search_icon_result:
+                                lobby_detected_count += 1
+                                self._log(f"Иконка поиска обнаружена! Проверка {lobby_detected_count}/3")
+                                
+                                # Требуем 3 последовательных обнаружения для надёжности
+                                if lobby_detected_count >= 3:
+                                    self._log("ЛОББИ ПОДТВЕРЖДЕНО автоматически! (иконка поиска найдена 3 раза)")
+                                    return True
+                            else:
+                                # Сбрасываем счётчик если иконка не найдена
+                                if lobby_detected_count > 0:
+                                    self._log("Иконка поиска не найдена, сброс счётчика")
+                                lobby_detected_count = 0
+                        except Exception as e:
+                            self._log(f"Ошибка поиска иконки: {e}")
+                else:
+                    # Если состояние не LOBBY - сбрасываем счётчик
+                    lobby_detected_count = 0
                 
                 # Очередь Xbox - просто ждём и информируем пользователя
                 if state == vision.ScreenState.XBOX_QUEUE:

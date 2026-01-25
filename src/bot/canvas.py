@@ -598,21 +598,44 @@ class CanvasNavigator:
         Открыть панель поиска островов.
         
         Пробует несколько методов:
-        1. Клик по иконке поиска (vision)
-        2. Хоткей /
-        3. Геймпад навигация к иконке
+        1. Клик по иконке поиска (vision - новый метод)
+        2. Клик по иконке поиска (template matching)
+        3. Хоткей /
+        4. Tab навигация
         
         Returns:
             True если поиск открыт
         """
         self._emit("Открываю поиск островов")
         
-        # Метод 1: Vision - найти и кликнуть иконку поиска
+        # Метод 1: Новый Vision метод - find_search_icon из vision.state
+        try:
+            from ..vision.state import find_search_icon
+            search_result = find_search_icon(self.page)
+            if search_result:
+                x, y, w, h = search_result
+                self._emit(f"Найдена иконка поиска через vision.find_search_icon at ({x}, {y})")
+                # Кликаем по центру иконки
+                click_x = x + w // 2
+                click_y = y + h // 2
+                self.page.mouse.click(click_x, click_y)
+                self.page.wait_for_timeout(800)
+                
+                # Проверяем что поиск открылся
+                new_snapshot = self.detect_screen_state()
+                if new_snapshot.state == ScreenState.SEARCH_PANEL or new_snapshot.has_element('search_input'):
+                    self._emit("Панель поиска открыта успешно!")
+                    return True
+                self._emit("Клик по лупе не открыл панель поиска, пробуем другие методы...")
+        except Exception as e:
+            self._emit(f"Ошибка в find_search_icon: {e}")
+        
+        # Метод 2: Template matching через detect_screen_state
         snapshot = self.detect_screen_state()
         search_icon = snapshot.get_element('search_icon')
         
         if search_icon:
-            self._emit("Найдена иконка поиска")
+            self._emit("Найдена иконка поиска через template matching")
             self.click_element(search_icon)
             self.page.wait_for_timeout(500)
             
@@ -621,7 +644,7 @@ class CanvasNavigator:
             if new_snapshot.state == ScreenState.SEARCH_PANEL:
                 return True
         
-        # Метод 2: Хоткей /
+        # Метод 3: Хоткей /
         self._emit("Пробую хоткей /")
         try:
             self.page.keyboard.press('/')
@@ -633,7 +656,7 @@ class CanvasNavigator:
         except Exception:
             pass
         
-        # Метод 3: Tab для переключения фокуса + навигация
+        # Метод 4: Tab для переключения фокуса + навигация
         self._emit("Пробую Tab навигацию")
         try:
             self.page.keyboard.press('Tab')

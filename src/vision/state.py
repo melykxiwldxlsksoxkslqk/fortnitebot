@@ -6,7 +6,7 @@ import os
 import time
 import cv2
 import numpy as np
-from typing import Optional, Union, List, Dict, Callable
+from typing import Optional, Union, List, Dict, Callable, Tuple
 from enum import Enum, auto
 from datetime import datetime
 
@@ -418,6 +418,185 @@ def _detect_title_screen(img: np.ndarray) -> bool:
         return False
 
 
+def _detect_fortnite_lobby(img: np.ndarray) -> bool:
+    """
+    Детектирует лобби Fortnite.
+    
+    Характерные признаки лобби:
+    - Жёлтая кнопка "PLAY" в нижней центральной части экрана
+    - Персонаж в центре
+    - UI элементы вверху (вкладки меню)
+    - Иконка поиска (лупа) в верхней левой части
+    """
+    try:
+        h, w = img.shape[:2]
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        mean_brightness = np.mean(gray)
+        
+        # Лобби яркое (не тёмная загрузка)
+        if mean_brightness < 50:
+            return False
+        
+        # 1. Ищем жёлтую кнопку PLAY в нижней центральной части
+        # Жёлтый в HSV: H=20-40, высокая насыщенность и яркость
+        bottom_center = img[int(h*0.7):int(h*0.95), int(w*0.3):int(w*0.7)]
+        bottom_hsv = cv2.cvtColor(bottom_center, cv2.COLOR_BGR2HSV)
+        
+        yellow_lower = np.array([15, 100, 150], dtype=np.uint8)
+        yellow_upper = np.array([45, 255, 255], dtype=np.uint8)
+        mask_yellow = cv2.inRange(bottom_hsv, yellow_lower, yellow_upper)
+        yellow_ratio = np.count_nonzero(mask_yellow) / mask_yellow.size
+        
+        # Если есть существенная жёлтая область снизу - вероятно кнопка PLAY
+        if yellow_ratio > 0.02:  # Минимум 2% жёлтого в нижней центральной части
+            _log_debug(f"_detect_fortnite_lobby: yellow_ratio={yellow_ratio:.4f} в нижней части - вероятно кнопка PLAY")
+            return True
+        
+        # 2. Альтернатива: ищем яркую UI панель вверху с вкладками
+        top_ui = img[0:int(h*0.15), :]
+        top_gray = cv2.cvtColor(top_ui, cv2.COLOR_BGR2GRAY)
+        top_brightness = np.mean(top_gray)
+        
+        # Ищем контрастные элементы в верхней части (вкладки меню)
+        top_edges = cv2.Canny(top_gray, 50, 150)
+        top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
+        
+        # Много контраста вверху + средняя яркость = вероятно UI лобби
+        if top_edge_ratio > 0.05 and top_brightness > 80 and mean_brightness > 80:
+            _log_debug(f"_detect_fortnite_lobby: top_edges={top_edge_ratio:.4f}, top_bright={top_brightness:.1f} - вероятно UI лобби")
+            return True
+        
+        return False
+    except Exception as e:
+        _log_debug(f"_detect_fortnite_lobby error: {e}")
+        return False
+
+
+def detect_fortnite_lobby_on_page(page) -> bool:
+    """Определяет, находится ли игра в лобби Fortnite."""
+    try:
+        img = capture_page_bgr(page)
+        return _detect_fortnite_lobby(img)
+    except Exception:
+        return False
+
+
+def find_search_icon(page_or_img) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Ищет иконку поиска (лупу) в лобби Fortnite.
+    
+    Лупа обычно находится в верхней левой части экрана.
+    
+    Args:
+        page_or_img: Playwright page или BGR изображение
+        
+    Returns:
+        (x, y, w, h) координаты иконки или None если не найдена
+    """
+    try:
+        img = _get_image(page_or_img)
+        h, w = img.shape[:2]
+        
+        # Область поиска: верхняя левая часть экрана (35% по ширине, 25% по высоте)
+        roi = img[0:int(h*0.25), 0:int(w*0.35)]
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        debug_info = {"roi_size": f"{roi.shape[1]}x{roi.shape[0]}"}
+        
+        # Пытаемся найти template
+        search_template_path = os.path.join(ROOT_DIR, 'assets', 'search_icon.png')
+        
+        best_val = 0
+        found = None
+        
+        if os.path.exists(search_template_path):
+            template = cv2.imread(search_template_path, cv2.IMREAD_GRAYSCALE)
+            if template is not None:
+                debug_info["template_size"] = f"{template.shape[1]}x{template.shape[0]}"
+                
+                # Multi-scale template matching
+                for scale in [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.4, 1.6]:
+                    resized_template = cv2.resize(template, None, fx=scale, fy=scale)
+                    if resized_template.shape[0] > roi_gray.shape[0] or resized_template.shape[1] > roi_gray.shape[1]:
+                        continue
+                    
+                    result = cv2.matchTemplate(roi_gray, resized_template, cv2.TM_CCOEFF_NORMED)
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                    
+                    if max_val > best_val:
+                        best_val = max_val
+                        th, tw = resized_template.shape[:2]
+                        found = (max_loc[0], max_loc[1], tw, th, scale)
+                
+                debug_info["best_confidence"] = f"{best_val:.3f}"
+                
+                if best_val > 0.45:  # Порог уверенности (снижен с 0.5)
+                    x, y, found_w, found_h, scale = found
+                    _log_debug(f"find_search_icon: найдена лупа с confidence={best_val:.3f} at ({x}, {y}) scale={scale}")
+                    debug_info["found"] = f"({x}, {y}) {found_w}x{found_h}"
+                    debug_info["scale"] = f"{scale}"
+                    
+                    # Сохраняем debug изображение с отмеченной областью
+                    if _VISION_DEBUG:
+                        debug_img = roi.copy()
+                        cv2.rectangle(debug_img, (x, y), (x + found_w, y + found_h), (0, 255, 0), 2)
+                        _save_debug_image(debug_img, "SEARCH_ICON_FOUND", debug_info)
+                    
+                    return (x, y, found_w, found_h)
+                else:
+                    _log_debug(f"find_search_icon: лупа не найдена, best_val={best_val:.3f}")
+        else:
+            debug_info["error"] = "template not found"
+            _log_debug(f"find_search_icon: файл шаблона не найден: {search_template_path}")
+        
+        # Сохраняем debug изображение когда лупа не найдена
+        if _VISION_DEBUG:
+            _save_debug_image(roi, "SEARCH_ICON_NOT_FOUND", debug_info)
+        
+        # Альтернатива: ищем по характерному контуру круга с "ручкой"
+        # Бинаризация для поиска светлых элементов
+        _, binary = cv2.threshold(roi_gray, 180, 255, cv2.THRESH_BINARY)
+        
+        # Ищем контуры
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if 100 < area < 5000:  # Примерный размер иконки
+                x, y, cnt_w, cnt_h = cv2.boundingRect(cnt)
+                aspect = cnt_w / cnt_h if cnt_h > 0 else 0
+                
+                # Лупа примерно квадратная или слегка вытянутая (с ручкой)
+                if 0.7 < aspect < 1.5:
+                    # Проверяем circularity
+                    perimeter = cv2.arcLength(cnt, True)
+                    circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+                    
+                    if circularity > 0.3:  # Достаточно круглый
+                        _log_debug(f"find_search_icon: найден кандидат лупы по контуру at ({x}, {y})")
+                        return (x, y, cnt_w, cnt_h)
+        
+        return None
+    except Exception as e:
+        _log_debug(f"find_search_icon error: {e}")
+        return None
+
+
+def detect_search_icon_on_page(page) -> bool:
+    """
+    Проверяет наличие иконки поиска на странице.
+    
+    Используется для подтверждения что игра находится в лобби.
+    
+    Returns:
+        True если иконка поиска найдена
+    """
+    result = find_search_icon(page)
+    return result is not None
+
+
 def detect_connecting_overlay_on_page(page) -> bool:
     """Определяет, виден ли на странице оверлей CONNECTING/LOGGING IN."""
     try:
@@ -661,6 +840,15 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         _log_info("Состояние: TITLE_SCREEN (титульный экран)")
         _save_debug_image(img, "TITLE_SCREEN", debug_info)
         return ScreenState.TITLE_SCREEN
+    
+    # 6.5. Лобби Fortnite (жёлтая кнопка PLAY, персонаж, UI вкладки)
+    is_lobby = _detect_fortnite_lobby(img)
+    debug_info["lobby_check"] = str(is_lobby)
+    _log_debug(f"  Проверка FORTNITE_LOBBY: {is_lobby}")
+    if is_lobby:
+        _log_info("Состояние: LOBBY (лобби Fortnite - обнаружена кнопка PLAY)")
+        _save_debug_image(img, "LOBBY", debug_info)
+        return ScreenState.LOBBY
     
     # 6. Страница входа Microsoft (белый фон с синими элементами)
     # НЕ путать с Xbox Cloud Gaming страницей которая тоже яркая!
