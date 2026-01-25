@@ -29,6 +29,7 @@ from .state import (
     detect_loading_spinner,
     detect_xbox_loading_screen,
     detect_game_ready,
+    set_vision_debug,
 )
 from .capture import (
     capture_screen,
@@ -64,6 +65,7 @@ __all__ = [
     'detect_loading_spinner',
     'detect_xbox_loading_screen',
     'detect_game_ready',
+    'set_vision_debug',
     # Capture
     'capture_screen',
     'capture_page_bgr',

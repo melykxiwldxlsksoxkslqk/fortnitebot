@@ -38,20 +38,30 @@ def capture_screen(region: Tuple[int, int, int, int] = None) -> np.ndarray:
     return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
 
-def capture_page_bgr(page) -> np.ndarray:
+def capture_page_bgr(page, full_page: bool = False) -> np.ndarray:
     """
     Захватывает скриншот Playwright страницы и возвращает BGR изображение.
     
     Args:
         page: Playwright page object
+        full_page: Захватывать всю страницу (включая скролл)
     
     Returns:
         BGR изображение (numpy array)
     """
     try:
-        png_bytes = page.screenshot(type='png', timeout=5000)
+        # Пробуем захватить весь viewport
+        png_bytes = page.screenshot(type='png', timeout=5000, full_page=full_page)
         arr = np.frombuffer(png_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        
+        # Если изображение слишком маленькое, пробуем захватить экран напрямую
+        if img is not None:
+            h, w = img.shape[:2]
+            # Минимальный размер - если меньше, используем pyautogui
+            if w < 800 or h < 600:
+                return capture_screen()
+        
         return img
     except Exception:
         # Fallback на скриншот экрана

@@ -112,6 +112,15 @@ def create_browser_camoufox(
             page = browser_context.new_page()
             context = browser_context
         
+        # Максимизируем окно браузера
+        try:
+            # Получаем размер экрана и устанавливаем viewport
+            screen_size = page.evaluate("() => ({ width: window.screen.availWidth, height: window.screen.availHeight })")
+            page.set_viewport_size({"width": screen_size["width"], "height": screen_size["height"]})
+            logger.debug(f"Viewport установлен: {screen_size['width']}x{screen_size['height']}")
+        except Exception as e:
+            logger.debug(f"Не удалось максимизировать окно: {e}")
+        
         logger.info("Camoufox браузер запущен")
         # Возвращаем cf как browser (для закрытия), context и page
         return cf, context, page
@@ -177,6 +186,14 @@ def create_browser_playwright(
             browser = engine.launch(**launch_kwargs)
             context = browser.new_context(no_viewport=True)
             page = context.new_page()
+        
+        # Максимизируем окно браузера
+        try:
+            screen_size = page.evaluate("() => ({ width: window.screen.availWidth, height: window.screen.availHeight })")
+            page.set_viewport_size({"width": screen_size["width"], "height": screen_size["height"]})
+            logger.debug(f"Viewport установлен: {screen_size['width']}x{screen_size['height']}")
+        except Exception as e:
+            logger.debug(f"Не удалось максимизировать окно: {e}")
         
         logger.info(f"Playwright {browser_type} запущен")
         return browser, context, page

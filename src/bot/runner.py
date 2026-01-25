@@ -130,7 +130,7 @@ class BotRunner:
                 self._log("Остановлен")
                 return False
             
-            # Поиск и запуск Fortnite
+            # Поиск и запуск Fortnite (включая ожидание сигнала лобби)
             if not self._find_and_launch_fortnite():
                 return False
             
@@ -138,15 +138,7 @@ class BotRunner:
                 self._log("Остановлен")
                 return False
             
-            # Ожидание игры
-            if not self._wait_for_game():
-                return False
-            
-            if self._should_stop():
-                self._log("Остановлен")
-                return False
-            
-            # Навигация к острову
+            # Навигация к острову (сигнал лобби уже получен)
             if not self._navigate_to_island():
                 return False
             
@@ -306,6 +298,103 @@ class BotRunner:
             return False
         except Exception:
             return False
+
+    def _scroll_page(self, direction: str = "down", amount: int = 300) -> None:
+        """
+        Скроллит страницу вверх или вниз.
+        
+        Args:
+            direction: "up" или "down"
+            amount: количество пикселей для скролла
+        """
+        try:
+            if direction == "down":
+                self.page.evaluate(f"window.scrollBy(0, {amount})")
+            else:
+                self.page.evaluate(f"window.scrollBy(0, -{amount})")
+            time.sleep(0.3)
+        except Exception as e:
+            logger.debug(f"Ошибка скролла: {e}")
+
+    def _scroll_to_element(self, selector: str) -> bool:
+        """
+        Скроллит к элементу если он существует.
+        
+        Args:
+            selector: CSS селектор элемента
+            
+        Returns:
+            True если элемент найден и проскроллен
+        """
+        try:
+            element = self.page.locator(selector).first
+            if element.count() > 0:
+                element.scroll_into_view_if_needed()
+                time.sleep(0.3)
+                return True
+        except Exception as e:
+            logger.debug(f"Ошибка скролла к элементу: {e}")
+        return False
+
+    def _find_play_button_with_scroll(self) -> bool:
+        """
+        Ищет кнопку Play со скроллом страницы вверх/вниз.
+        
+        Returns:
+            True если кнопка найдена и нажата
+        """
+        play_selectors = [
+            'button:has-text("Hrát")',
+            'button:has-text("Play")',
+            'button:has-text("Играть")',
+            '[data-bi-id="play-button"]',
+        ]
+        
+        # Сначала пробуем найти без скролла
+        for sel in play_selectors:
+            try:
+                btn = self.page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    self._log("Кнопка Play найдена")
+                    return True
+            except Exception:
+                continue
+        
+        # Скроллим вверх к началу страницы
+        self._log("Кнопка Play не видна, скроллим вверх...")
+        self.page.evaluate("window.scrollTo(0, 0)")
+        time.sleep(0.5)
+        
+        # Проверяем после скролла вверх
+        for sel in play_selectors:
+            try:
+                btn = self.page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    self._log("Кнопка Play найдена после скролла вверх")
+                    return True
+            except Exception:
+                continue
+        
+        # Скроллим вниз постепенно
+        for scroll_step in range(5):
+            self._log(f"Скроллим вниз... (шаг {scroll_step + 1})")
+            self._scroll_page("down", 400)
+            time.sleep(0.5)
+            
+            for sel in play_selectors:
+                try:
+                    btn = self.page.locator(sel).first
+                    if btn.count() > 0 and btn.is_visible():
+                        self._log("Кнопка Play найдена после скролла вниз")
+                        return True
+                except Exception:
+                    continue
+        
+        # Возвращаемся наверх
+        self.page.evaluate("window.scrollTo(0, 0)")
+        time.sleep(0.3)
+        
+        return False
 
     def _handle_title_screen(self) -> bool:
         """Обрабатывает титульный экран Fortnite - нажимает любую клавишу для продолжения."""
@@ -886,9 +975,56 @@ class BotRunner:
             except Exception:
                 pass
             
-            for attempt in range(15):  # Ждём до 15 секунд появления кнопки Play
+            play_clicked = False
+            scroll_attempted = False
+            
+            for attempt in range(20):  # Увеличил до 20 попыток для скролла
                 if self._should_stop():
                     return False
+                
+                # На 5-й попытке пробуем скролл если кнопка не найдена
+                if attempt == 5 and not play_clicked and not scroll_attempted:
+                    self._log("Кнопка Play не найдена, пробуем скролл...")
+                    scroll_attempted = True
+                    if self._find_play_button_with_scroll():
+                        # Кнопка найдена после скролла, продолжаем поиск
+                        pass
+                
+                # Если уже кликнули Play - проверяем результат
+                if play_clicked:
+                    # Проверяем появился ли диалог контроллера или началась загрузка
+                    if self._handle_controller_dialog():
+                        self._log("Диалог контроллера закрыт после Play")
+                        return True
+                    
+                    # Проверяем состояние экрана - может уже загрузка началась
+                    try:
+                        state = vision.detect_screen_state(self.page)
+                        if state in (vision.ScreenState.LOADING, vision.ScreenState.XBOX_LOADING, 
+                                    vision.ScreenState.XBOX_QUEUE, vision.ScreenState.CONNECTING,
+                                    vision.ScreenState.PLANE_SCREEN):
+                            self._log(f"Загрузка началась: {state.name}")
+                            return True
+                    except Exception:
+                        pass
+                    
+                    # Проверяем не осталась ли кнопка Play видимой (клик не сработал)
+                    play_still_visible = False
+                    try:
+                        play_check = self.page.locator('button:has-text("Play"), button:has-text("Hrát"), button:has-text("Играть")')
+                        if play_check.count() > 0 and play_check.first.is_visible():
+                            play_still_visible = True
+                    except Exception:
+                        pass
+                    
+                    if not play_still_visible:
+                        # Кнопка исчезла - значит клик сработал
+                        self._log("Кнопка Play исчезла - клик успешен")
+                        return True
+                    else:
+                        # Кнопка всё ещё видна - сбрасываем флаг и пробуем снова
+                        self._log("Кнопка Play всё ещё видна - повторяем клик...")
+                        play_clicked = False
                 
                 # Проверяем ещё раз не появилась ли кнопка входа
                 if attempt == 5:  # На 5-й попытке
@@ -907,19 +1043,32 @@ class BotRunner:
                             self._log("Нажимаем Play...")
                             try:
                                 play_btn.click(force=True, timeout=5000)
-                                time.sleep(2)
-                                return True
+                                play_clicked = True
+                                time.sleep(1)
+                                # Сразу проверяем диалог контроллера
+                                if self._handle_controller_dialog():
+                                    self._log("Диалог контроллера обработан, ожидание загрузки...")
+                                    return self._wait_for_game()
+                                time.sleep(1)
+                                break  # Выходим из цикла селекторов, проверим результат
                             except Exception as click_err:
                                 self._log(f"Ошибка клика Play: {click_err}")
                                 # Пробуем JavaScript клик
                                 try:
                                     play_btn.evaluate("el => el.click()")
-                                    time.sleep(2)
-                                    return True
+                                    play_clicked = True
+                                    time.sleep(1)
+                                    if self._handle_controller_dialog():
+                                        return self._wait_for_game()
+                                    time.sleep(1)
+                                    break
                                 except Exception:
                                     pass
                     except Exception:
                         continue
+                
+                if play_clicked:
+                    continue  # Проверим результат на следующей итерации
                 
                 # Пробуем найти кнопку по роли - это надёжнее чем по тексту
                 # Ищем кнопку (не ссылку!) с текстом Hrát/Play
@@ -928,10 +1077,11 @@ class BotRunner:
                     if play_btn.count() > 0 and play_btn.first.is_visible():
                         self._log("Нажимаем кнопку Hrát...")
                         play_btn.first.click()
-                        time.sleep(2)
-                        # Обрабатываем диалог контроллера
-                        self._handle_controller_dialog()
-                        return True
+                        play_clicked = True
+                        time.sleep(1)
+                        if self._handle_controller_dialog():
+                            return self._wait_for_game()
+                        continue
                 except Exception:
                     pass
                 
@@ -940,10 +1090,11 @@ class BotRunner:
                     if play_btn.count() > 0 and play_btn.first.is_visible():
                         self._log("Нажимаем кнопку Play...")
                         play_btn.first.click()
-                        time.sleep(2)
-                        # Обрабатываем диалог контроллера
-                        self._handle_controller_dialog()
-                        return True
+                        play_clicked = True
+                        time.sleep(1)
+                        if self._handle_controller_dialog():
+                            return self._wait_for_game()
+                        continue
                 except Exception:
                     pass
                 
@@ -952,14 +1103,21 @@ class BotRunner:
                     if play_btn.count() > 0 and play_btn.first.is_visible():
                         self._log("Нажимаем кнопку Играть...")
                         play_btn.first.click()
-                        time.sleep(2)
-                        # Обрабатываем диалог контроллера
-                        self._handle_controller_dialog()
-                        return True
+                        play_clicked = True
+                        time.sleep(1)
+                        if self._handle_controller_dialog():
+                            return self._wait_for_game()
+                        continue
                 except Exception:
                     pass
                     
                 time.sleep(1)
+            
+            # Финальная проверка - если кликали, начинаем ожидание
+            if play_clicked:
+                self._log("Play был нажат, начинаем ожидание загрузки...")
+                # Сразу переходим к ожиданию сигнала лобби
+                return self._wait_for_game()
             
             self._log("Кнопка Play не найдена")
             return False
@@ -969,18 +1127,23 @@ class BotRunner:
             return False
     
     def _wait_for_game(self) -> bool:
-        """Ожидает загрузки игры."""
-        self._log("Ожидание загрузки игры...")
+        """Ожидает загрузки игры и ручного сигнала о готовности лобби."""
+        self._log("Ожидание загрузки игры и сигнала 'Лобби готово'...")
         
-        # Сразу проверяем диалог контроллера - он появляется после нажатия Play
-        self._handle_controller_dialog()
+        # Включаем debug логирование vision
+        try:
+            vision.set_vision_debug(True)
+        except Exception:
+            pass
         
         start = time.time()
-        timeout = 300  # 5 минут - Xbox Cloud может долго подключаться
-        connecting_start = None
+        timeout = 600  # 10 минут - ждём ручного сигнала
         last_state = None
-        login_attempts = 0
         controller_dialog_checked = 0
+        play_retry_count = 0  # Счётчик повторных попыток нажать Play
+        last_log_time = 0
+        
+        self._log("Нажмите кнопку 'Лобби готово' в UI когда персонаж появится в лобби")
         
         while time.time() - start < timeout:
             # Проверяем остановку
@@ -988,24 +1151,83 @@ class BotRunner:
                 self._log("Остановлен во время ожидания игры")
                 return False
             
+            # ГЛАВНАЯ ПРОВЕРКА: ручной сигнал о готовности лобби
+            if self.manual_lobby_event and self.manual_lobby_event.is_set():
+                self._log("Получен сигнал: ЛОББИ ГОТОВО!")
+                self.manual_lobby_event.clear()  # Сбрасываем флаг для следующего раза
+                return True
+            
             # Периодически проверяем диалог контроллера (первые 30 секунд)
             if controller_dialog_checked < 10 and time.time() - start < 30:
                 self._handle_controller_dialog()
                 self._handle_fullscreen_popup()
                 controller_dialog_checked += 1
             
+            # Проверяем не осталась ли кнопка Play видимой (клик не сработал)
+            # Делаем это в первые 20 секунд
+            if time.time() - start < 20 and play_retry_count < 5:
+                try:
+                    play_check = self.page.locator('button:has-text("Play"), button:has-text("Hrát"), button:has-text("Играть")')
+                    if play_check.count() > 0 and play_check.first.is_visible():
+                        self._log("Кнопка Play всё ещё видна - повторяем клик...")
+                        play_retry_count += 1
+                        try:
+                            play_check.first.click(force=True, timeout=3000)
+                        except Exception:
+                            try:
+                                play_check.first.evaluate("el => el.click()")
+                            except Exception:
+                                pass
+                        time.sleep(1)
+                        # Проверяем диалог контроллера после клика
+                        self._handle_controller_dialog()
+                        continue
+                except Exception:
+                    pass
+            
             try:
-                # Проверяем состояние экрана
+                # ВАЖНО: Проверяем не вернулись ли мы на главную страницу Xbox (игра закрылась)
+                try:
+                    current_url = self.page.url.lower()
+                    # Если мы на главной странице xbox.com/play (без /games/fortnite) - игра закрылась!
+                    if "xbox.com/play" in current_url and "/games/" not in current_url:
+                        self._log("ВНИМАНИЕ: Игра закрылась! Xbox вернул на главную страницу.")
+                        self._log("Пробуем перезапустить игру...")
+                        
+                        # Пробуем перезапустить Fortnite
+                        self.page.goto("https://www.xbox.com/play/games/fortnite/BT5P2X999VH2", 
+                                      wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(3)
+                        
+                        # Ищем и нажимаем Play
+                        try:
+                            play_btn = self.page.locator('button:has-text("Play"), button:has-text("Hrát"), button:has-text("Играть")').first
+                            if play_btn.is_visible():
+                                self._log("Нажимаем Play для перезапуска...")
+                                play_btn.click(force=True)
+                                time.sleep(2)
+                                self._handle_controller_dialog()
+                        except Exception:
+                            pass
+                        
+                        # Сбрасываем счётчики
+                        controller_dialog_checked = 0
+                        play_retry_count = 0
+                        continue
+                except Exception:
+                    pass
+                
+                # Проверяем состояние экрана для логирования
                 state = vision.detect_screen_state(self.page)
                 
-                if state == vision.ScreenState.LOBBY:
-                    self._log("Лобби обнаружено!")
-                    return True
+                # Логируем состояние каждые 10 секунд или при смене
+                current_time = time.time()
+                if state != last_state or current_time - last_log_time > 10:
+                    self._log(f"Состояние экрана: {state.name}")
+                    last_state = state
+                    last_log_time = current_time
                 
-                if state == vision.ScreenState.IN_GAME:
-                    self._log("Игра готова!")
-                    return True
-                
+                # Обработка специфичных состояний (но НЕ автоматический переход в лобби)
                 if state == vision.ScreenState.MENU:
                     self._log("Меню обнаружено - пробуем закрыть...")
                     self.page.keyboard.press('Escape')
@@ -1017,63 +1239,12 @@ class BotRunner:
                     self._log("Титульный экран Fortnite - нажимаем для продолжения...")
                     self.page.keyboard.press('Enter')
                     time.sleep(3)
-                    # Проверяем изменилось ли состояние
-                    new_state = vision.detect_screen_state(self.page)
-                    if new_state in (vision.ScreenState.LOBBY, vision.ScreenState.IN_GAME):
-                        self._log("Перешли в лобби!")
-                        return True
                     continue
                 
-                # Резервная логика: если UNKNOWN слишком долго - пробуем нажать
-                if state == vision.ScreenState.UNKNOWN and time.time() - start > 90:
-                    # После 90 секунд если состояние UNKNOWN - пробуем нажать
-                    self._log("Неизвестное состояние - пробуем нажать Enter...")
-                    self.page.keyboard.press('Enter')
-                    time.sleep(2)
-                    # Проверяем изменилось ли состояние
-                    new_state = vision.detect_screen_state(self.page)
-                    if new_state in (vision.ScreenState.LOBBY, vision.ScreenState.IN_GAME, vision.ScreenState.TITLE_SCREEN):
-                        self._log("Состояние изменилось!")
-                        if new_state in (vision.ScreenState.LOBBY, vision.ScreenState.IN_GAME):
-                            return True
-                        continue
-                
-                # Если на странице входа Microsoft - пробуем войти
-                # Но ТОЛЬКО если URL указывает на login.live или login.microsoftonline
-                if state == vision.ScreenState.LOGIN_PAGE and login_attempts < 3:
-                    try:
-                        current_url = self.page.url.lower()
-                        if "login.live" in current_url or "login.microsoftonline" in current_url:
-                            self._log("Страница входа Microsoft - пробуем авторизоваться...")
-                            login_attempts += 1
-                            if self._handle_login():
-                                time.sleep(3)
-                                continue
-                    except Exception:
-                        pass
-                
-                # Ручной сигнал
-                if self.manual_lobby_event and self.manual_lobby_event.is_set():
-                    self._log("Ручное подтверждение лобби")
-                    return True
-                
-                # Логируем только при смене состояния
-                if state != last_state:
-                    self._log(f"Состояние: {state.name}")
-                    last_state = state
-                    
-                    # Сброс таймера CONNECTING при смене состояния
-                    if state == vision.ScreenState.CONNECTING:
-                        connecting_start = time.time()
-                
-                # Если CONNECTING слишком долго (> 3 минут), пробуем обновить страницу
-                if state == vision.ScreenState.CONNECTING and connecting_start:
-                    if time.time() - connecting_start > 180:
-                        self._log("CONNECTING слишком долго, обновляем страницу...")
-                        self.page.reload(wait_until="domcontentloaded", timeout=30000)
-                        connecting_start = time.time()
-                        time.sleep(5)
-                        continue
+                # Очередь Xbox - просто ждём и информируем пользователя
+                if state == vision.ScreenState.XBOX_QUEUE:
+                    if last_state != vision.ScreenState.XBOX_QUEUE:
+                        self._log("В очереди Xbox Game Pass, ожидание...")
                 
                 time.sleep(2)
                 
@@ -1081,144 +1252,78 @@ class BotRunner:
                 self._log(f"Ошибка проверки состояния: {e}")
                 time.sleep(1)
         
-        self._log("Таймаут ожидания игры")
+        self._log("Таймаут ожидания сигнала лобби (10 мин)")
         return False
     
     def _navigate_to_island(self) -> bool:
-        """Навигация к острову через UI Fortnite."""
+        """Навигация к острову через Canvas Navigator."""
         self._log(f"Навигация к острову: {self.island_code}")
         
         try:
             if self._should_stop():
                 return False
             
-            # В Fortnite лобби можно использовать клавиатуру для навигации
-            # Открываем меню выбора режима (Tab или Escape)
-            self._log("Открытие меню выбора режима...")
-            time.sleep(3)  # Даём лобби полностью загрузиться
+            # Импортируем CanvasNavigator
+            from .canvas import CanvasNavigator, ScreenState as CanvasScreenState
+            
+            # Создаём навигатор
+            navigator = CanvasNavigator(
+                self.page,
+                status_callback=self._log
+            )
+            
+            self._log("Инициализация Canvas Navigator...")
+            time.sleep(2)  # Даём лобби полностью загрузиться
             
             if self._should_stop():
                 return False
             
-            # Нажимаем Tab для открытия меню режимов или Enter для Play
-            # В Xbox Cloud Gaming управление через геймпад эмулируется клавиатурой
-            
-            # Пробуем открыть меню острова через интерфейс
-            # Сначала попробуем использовать клавишу для открытия меню "Play"
-            self.page.keyboard.press('Enter')
-            time.sleep(2)
-            
-            if self._should_stop():
-                return False
-            
-            # Ищем кнопку "Island Code" или "Discover" через UI
-            # Эмулируем нажатия геймпада: стрелки для навигации
-            
-            # Нажимаем несколько раз вверх/вниз чтобы найти нужный пункт меню
-            # В Fortnite обычно: вверх-вверх для "Island Code"
-            
-            self._log("Навигация к Island Code...")
-            
-            # Пробуем найти и кликнуть на "ISLAND CODE" или "Change Island" текст
-            island_code_selectors = [
-                'button:has-text("Island Code")',
-                'button:has-text("ISLAND CODE")',
-                'button:has-text("Change")',
-                '[data-testid*="island"]',
-            ]
-            
-            found_island_button = False
-            for sel in island_code_selectors:
-                try:
-                    btn = self.page.locator(sel).first
-                    if btn.count() > 0 and btn.is_visible():
-                        self._log("Найдена кнопка Island Code")
-                        btn.click()
-                        found_island_button = True
-                        time.sleep(2)
-                        break
-                except Exception:
-                    continue
-            
-            if self._should_stop():
-                return False
-            
-            # Если не нашли кнопку - используем клавиатурную навигацию
-            if not found_island_button:
-                self._log("Использование клавиатурной навигации...")
-                # Tab открывает меню в Fortnite
-                self.page.keyboard.press('Tab')
-                time.sleep(1)
-                
-                # Стрелки для навигации
-                for _ in range(3):
-                    self.page.keyboard.press('ArrowUp')
-                    time.sleep(0.3)
-                
-                self.page.keyboard.press('Enter')
-                time.sleep(1)
-            
-            if self._should_stop():
-                return False
-            
-            # Вводим код острова
-            self._log(f"Ввод кода острова: {self.island_code}")
-            
-            # Ищем поле ввода
-            input_selectors = [
-                'input[type="text"]',
-                'input[placeholder*="code"]',
-                'input[placeholder*="Code"]',
-                '[contenteditable="true"]',
-            ]
-            
-            input_found = False
-            for sel in input_selectors:
-                try:
-                    input_field = self.page.locator(sel).first
-                    if input_field.count() > 0 and input_field.is_visible():
-                        input_field.fill(self.island_code)
-                        input_found = True
-                        time.sleep(1)
-                        break
-                except Exception:
-                    continue
-            
-            if not input_found:
-                # Пробуем просто набрать код - может быть активное поле ввода
-                self._log("Попытка прямого ввода кода...")
-                self.page.keyboard.type(self.island_code, delay=100)
+            # Устанавливаем фокус на канвас
+            self._log("Установка фокуса на игровой канвас...")
+            if not navigator.ensure_focus():
+                self._log("Предупреждение: не удалось установить фокус на канвас, продолжаем...")
             
             time.sleep(1)
             
             if self._should_stop():
                 return False
             
+            # Используем полный цикл поиска и запуска острова
+            self._log("Запуск поиска острова...")
+            success = navigator.search_and_launch_island(self.island_code)
+            
+            if success:
+                self._log("Остров успешно запущен!")
+                return True
+            else:
+                self._log("Автоматическая навигация не удалась, пробуем ручной метод...")
+            
+            if self._should_stop():
+                return False
+            
+            # Fallback: ручная навигация через клавиатуру
+            self._log("Пробуем открыть поиск через клавишу '/'...")
+            self.page.keyboard.press('/')
+            time.sleep(1)
+            
+            # Вводим код острова
+            self._log(f"Ввод кода острова: {self.island_code}")
+            self.page.keyboard.type(self.island_code, delay=50)
+            time.sleep(0.5)
+            
             # Подтверждаем
             self.page.keyboard.press('Enter')
             time.sleep(2)
             
-            # Ищем кнопку Play/Launch
-            launch_selectors = [
-                'button:has-text("Play")',
-                'button:has-text("PLAY")',
-                'button:has-text("Launch")',
-                'button:has-text("Go")',
-                'button:has-text("Hrát")',
-            ]
+            # Ещё раз Enter для выбора острова
+            self.page.keyboard.press('Enter')
+            time.sleep(1)
             
-            for sel in launch_selectors:
-                try:
-                    btn = self.page.locator(sel).first
-                    if btn.count() > 0 and btn.is_visible():
-                        self._log("Запуск острова...")
-                        btn.click()
-                        time.sleep(2)
-                        break
-                except Exception:
-                    continue
+            # И ещё раз для Play
+            self.page.keyboard.press('Enter')
+            time.sleep(1)
             
-            self._log("Навигация завершена")
+            self._log("Навигация завершена (fallback)")
             return True
             
         except Exception as e:

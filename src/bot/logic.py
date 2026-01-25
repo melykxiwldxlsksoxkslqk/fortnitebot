@@ -64,12 +64,12 @@ class BotLogic:
         try:
             self.manual_lobby_event.set()
             try:
-                vision.set_global_debug(True)
+                vision.set_vision_debug(True)
             except Exception:
                 pass
             self._log("Получен сигнал: лобби готово (ручной)")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Ошибка при сигнале лобби: {e}")
 
     def request_stop(self):
         """Запрашивает остановку бота."""
