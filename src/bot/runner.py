@@ -1143,7 +1143,7 @@ class BotRunner:
         play_retry_count = 0  # Счётчик повторных попыток нажать Play
         last_log_time = 0
         lobby_detected_count = 0  # Счётчик последовательных обнаружений лобби
-        search_icon_check_interval = 5  # Проверять иконку поиска каждые 5 секунд
+        search_icon_check_interval = 2  # Проверять иконку поиска каждые 2 секунды
         last_search_icon_check = 0
         
         self._log("Нажмите кнопку 'Лобби готово' в UI когда персонаж появится в лобби")
@@ -1302,10 +1302,11 @@ class BotRunner:
             # Импортируем CanvasNavigator
             from .canvas import CanvasNavigator, ScreenState as CanvasScreenState
             
-            # Создаём навигатор
+            # Создаём навигатор с поддержкой геймпада
             navigator = CanvasNavigator(
                 self.page,
-                status_callback=self._log
+                status_callback=self._log,
+                use_gamepad=True  # Включаем виртуальный геймпад
             )
             
             self._log("Инициализация Canvas Navigator...")
@@ -1324,8 +1325,20 @@ class BotRunner:
             if self._should_stop():
                 return False
             
-            # Используем полный цикл поиска и запуска острова
-            self._log("Запуск поиска острова...")
+            # Метод 1: Пробуем через геймпад навигацию (более надёжно)
+            self._log("Пробуем запуск острова через геймпад навигацию...")
+            success = navigator.search_and_launch_island_gamepad(self.island_code)
+            
+            if success:
+                self._log("Остров успешно запущен через геймпад!")
+                return True
+            
+            self._log("Геймпад метод не сработал, пробуем через поиск элементов...")
+            
+            if self._should_stop():
+                return False
+            
+            # Метод 2: Пробуем через поиск элементов на экране
             success = navigator.search_and_launch_island(self.island_code)
             
             if success:
