@@ -157,10 +157,23 @@ class BotRunner:
             # Время на острове - проверяем остановку каждую секунду
             time_on_island = int(get_setting('time_on_island_min', 15))
             self._log(f"На острове. Ожидание {time_on_island} мин...")
-            for _ in range(time_on_island * 60):
+            last_debug_time = 0
+            for i in range(time_on_island * 60):
                 if self._should_stop():
                     self._log("Остановлен пользователем")
                     return False
+                
+                # Периодически проверяем состояние экрана (каждые 30 сек) для debug
+                current_time = time.time()
+                if current_time - last_debug_time > 30:
+                    try:
+                        state = vision.detect_screen_state(self.page)
+                        if i % 60 == 0:  # Логируем каждую минуту
+                            self._log(f"[{i//60} мин] Состояние: {state.name}")
+                    except Exception:
+                        pass
+                    last_debug_time = current_time
+                
                 time.sleep(1)
             
             self._log("Успешно завершено!")
@@ -1003,7 +1016,8 @@ class BotRunner:
                     # Проверяем появился ли диалог контроллера или началась загрузка
                     if self._handle_controller_dialog():
                         self._log("Диалог контроллера закрыт после Play")
-                        return True
+                        # Переходим к ожиданию полной загрузки игры
+                        return self._wait_for_game()
                     
                     # Проверяем состояние экрана - может уже загрузка началась
                     try:
@@ -1012,7 +1026,8 @@ class BotRunner:
                                     vision.ScreenState.XBOX_QUEUE, vision.ScreenState.CONNECTING,
                                     vision.ScreenState.PLANE_SCREEN):
                             self._log(f"Загрузка началась: {state.name}")
-                            return True
+                            # ВАЖНО: Переходим к ожиданию полной загрузки лобби, а не сразу возвращаем True!
+                            return self._wait_for_game()
                     except Exception:
                         pass
                     
@@ -1026,9 +1041,9 @@ class BotRunner:
                         pass
                     
                     if not play_still_visible:
-                        # Кнопка исчезла - значит клик сработал
-                        self._log("Кнопка Play исчезла - клик успешен")
-                        return True
+                        # Кнопка исчезла - значит клик сработал, ждём загрузку
+                        self._log("Кнопка Play исчезла - ожидаем загрузку...")
+                        return self._wait_for_game()
                     else:
                         # Кнопка всё ещё видна - сбрасываем флаг и пробуем снова
                         self._log("Кнопка Play всё ещё видна - повторяем клик...")
@@ -1325,12 +1340,121 @@ class BotRunner:
         self._log("Таймаут ожидания сигнала лобби (10 мин)")
         return False
     
+    def _wait_for_fortnite_lobby(self) -> bool:
+        """
+        Ожидает пока Fortnite полностью загрузится и появится НАСТОЯЩЕЕ лобби.
+        
+        Проверяет:
+        1. Игра не в состоянии загрузки (LOADING, CONNECTING, XBOX_QUEUE и т.д.)
+        2. Экран показывает реальное лобби Fortnite с UI (кнопка PLAY)
+        3. Стабильное состояние (не меняется 3 секунды)
+        
+        Returns:
+            True если лобби готово
+        """
+        self._log("Ожидание загрузки Fortnite лобби...")
+        
+        start_time = time.time()
+        timeout = 300  # 5 минут максимум на загрузку
+        
+        # Состояния загрузки (нужно ждать пока они пройдут)
+        loading_states = {
+            vision.ScreenState.LOADING,
+            vision.ScreenState.CONNECTING, 
+            vision.ScreenState.XBOX_LOADING,
+            vision.ScreenState.XBOX_QUEUE,
+            vision.ScreenState.PLANE_SCREEN,
+            vision.ScreenState.TITLE_SCREEN,
+            vision.ScreenState.UNKNOWN,
+        }
+        
+        stable_lobby_count = 0  # Счётчик стабильного состояния LOBBY
+        last_state = None
+        last_state_change = time.time()
+        
+        while time.time() - start_time < timeout:
+            if self._should_stop():
+                return False
+            
+            # Ручной сигнал
+            if self.manual_lobby_event and self.manual_lobby_event.is_set():
+                self._log("Получен ручной сигнал: ЛОББИ ГОТОВО!")
+                self.manual_lobby_event.clear()
+                return True
+            
+            try:
+                state = vision.detect_screen_state(self.page)
+                current_time = time.time()
+                
+                # Логируем при смене состояния
+                if state != last_state:
+                    self._log(f"[Загрузка] Состояние: {state.name}")
+                    last_state = state
+                    last_state_change = current_time
+                    stable_lobby_count = 0
+                
+                # Титульный экран - нужно нажать кнопку
+                if state == vision.ScreenState.TITLE_SCREEN:
+                    self._log("Титульный экран - нажимаем Enter для продолжения...")
+                    self.page.keyboard.press('Enter')
+                    time.sleep(2)
+                    continue
+                
+                # Проверяем диалоги
+                self._handle_controller_dialog()
+                
+                # Если состояние LOBBY - проверяем стабильность
+                if state == vision.ScreenState.LOBBY:
+                    # Состояние стабильно минимум 3 секунды?
+                    if current_time - last_state_change >= 3:
+                        stable_lobby_count += 1
+                        
+                        if stable_lobby_count >= 2:  # 2 проверки подряд
+                            self._log("Лобби Fortnite загружено и стабильно!")
+                            
+                            # Нажимаем F9 для захвата фокуса
+                            self._log("Нажимаем F9 для захвата фокуса...")
+                            try:
+                                self.page.keyboard.press('F9')
+                                time.sleep(0.5)
+                            except Exception:
+                                pass
+                            
+                            return True
+                
+                # Если состояние IN_GAME - тоже OK
+                if state == vision.ScreenState.IN_GAME:
+                    if current_time - last_state_change >= 3:
+                        self._log("Обнаружена игра - возможно уже в матче!")
+                        return True
+                
+                # Если ещё загружается - просто ждём
+                if state in loading_states:
+                    # Логируем прогресс каждые 30 секунд
+                    elapsed = int(current_time - start_time)
+                    if elapsed > 0 and elapsed % 30 == 0:
+                        self._log(f"[{elapsed}с] Всё ещё загружается: {state.name}")
+                
+            except Exception as e:
+                self._log(f"Ошибка проверки состояния: {e}")
+            
+            time.sleep(1)
+        
+        self._log("Таймаут загрузки Fortnite лобби (5 мин)")
+        return False
+    
     def _navigate_to_island(self) -> bool:
         """Навигация к острову через Canvas Navigator."""
         self._log(f"Навигация к острову: {self.island_code}")
         
         try:
             if self._should_stop():
+                return False
+            
+            # ВАЖНО: Ждём пока игра полностью загрузится и появится НАСТОЯЩЕЕ лобби Fortnite
+            self._log("Ожидание полной загрузки лобби Fortnite...")
+            if not self._wait_for_fortnite_lobby():
+                self._log("Не удалось дождаться загрузки лобби Fortnite")
                 return False
             
             # Импортируем CanvasNavigator
@@ -1344,7 +1468,7 @@ class BotRunner:
             )
             
             self._log("Инициализация Canvas Navigator...")
-            time.sleep(2)  # Даём лобби полностью загрузиться
+            time.sleep(2)  # Даём лобби полностью стабилизироваться
             
             if self._should_stop():
                 return False
@@ -1359,7 +1483,20 @@ class BotRunner:
             if self._should_stop():
                 return False
             
-            # Метод 1: Пробуем через геймпад навигацию (более надёжно)
+            # Метод 1: Пробуем новый Xbox метод (скролл + search bar + диалог)
+            self._log("Пробуем запуск острова через Xbox метод...")
+            success = navigator.search_and_launch_island_xbox(self.island_code)
+            
+            if success:
+                self._log("Остров успешно запущен через Xbox метод!")
+                return True
+            
+            self._log("Xbox метод не сработал, пробуем через геймпад...")
+            
+            if self._should_stop():
+                return False
+            
+            # Метод 2: Пробуем через геймпад навигацию
             self._log("Пробуем запуск острова через геймпад навигацию...")
             success = navigator.search_and_launch_island_gamepad(self.island_code)
             
@@ -1372,7 +1509,7 @@ class BotRunner:
             if self._should_stop():
                 return False
             
-            # Метод 2: Пробуем через поиск элементов на экране
+            # Метод 3: Пробуем через поиск элементов на экране
             success = navigator.search_and_launch_island(self.island_code)
             
             if success:

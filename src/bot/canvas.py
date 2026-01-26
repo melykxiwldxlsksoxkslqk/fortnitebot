@@ -16,6 +16,7 @@ Canvas Navigation Module - умная навигация в канвас-стр�
 import time
 import random
 import hashlib
+import os
 from enum import Enum, auto
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Callable, Dict, List, Tuple, Any, Union
@@ -289,9 +290,10 @@ class CanvasNavigator:
             self.page.mouse.click(cx, cy)
             self.page.wait_for_timeout(100)
             
-            # Нажимаем Tab для активации фокуса (вместо F13 который не поддерживается)
+            # Нажимаем F9 для захвата фокуса Xbox Cloud Gaming
             try:
-                self.page.keyboard.press('Tab')
+                self.page.keyboard.press('F9')
+                self.page.wait_for_timeout(200)
             except Exception:
                 pass
             
@@ -355,6 +357,11 @@ class CanvasNavigator:
         
         if self._vision:
             for template_path, elem_name, assoc_state, roi in templates_to_check:
+                # Пропускаем несуществующие файлы шаблонов
+                full_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), template_path)
+                if not os.path.exists(full_path):
+                    continue
+                    
                 try:
                     result = self._vision.find_template(
                         img, 
@@ -1042,6 +1049,175 @@ class CanvasNavigator:
         self.page.wait_for_timeout(1000)
         
         self._emit("Остров запущен через геймпад!")
+        return True
+    
+    def search_and_launch_island_xbox(self, code: str) -> bool:
+        """
+        Метод запуска острова для Xbox Cloud Gaming.
+        
+        Новый паттерн:
+        1. Скролл вниз в лобби
+        2. Клик по search bar "Search Discover"
+        3. Появляется Xbox диалог с полем ввода
+        4. Ввести код острова
+        5. Нажать кнопку "ODESLAT" (отправить)
+        6. Кликнуть на первую карту в результатах
+        7. Нажать желтую кнопку "SELECT"
+        8. Нажать кнопку "PLAY"
+        
+        Args:
+            code: Код острова
+            
+        Returns:
+            True если остров запущен
+        """
+        self._emit(f"Запуск острова через Xbox метод: {code}")
+        
+        # 1. Убедиться в фокусе
+        if not self.ensure_focus():
+            self._emit("Не удалось установить фокус")
+            return False
+        
+        self.page.wait_for_timeout(500)
+        
+        # 2. Скролл вниз чтобы увидеть search bar
+        self._emit("Скролл вниз к поиску...")
+        bounds = self.get_canvas_bounds()
+        if bounds:
+            cx, cy, cw, ch = bounds
+            # Скролл в центре экрана вниз
+            center_x = cx + cw // 2
+            center_y = cy + ch // 2
+            self.page.mouse.move(center_x, center_y)
+            self.page.mouse.wheel(0, 300)  # Скролл вниз
+            self.page.wait_for_timeout(800)
+        
+        # 3. Клик по search bar "Search Discover"
+        self._emit("Ищу и кликаю по Search Discover...")
+        search_clicked = False
+        
+        # Пробуем найти search bar через DOM (iframe Xbox)
+        try:
+            # Search bar обычно в верхней левой части с иконкой лупы
+            # Координаты примерно 5-15% сверху, 5-40% слева
+            if bounds:
+                # Пробуем кликнуть по области поиска (верхняя левая часть)
+                search_x = cx + int(cw * 0.20)  # 20% слева
+                search_y = cy + int(ch * 0.12)  # 12% сверху
+                
+                self._emit(f"Кликаю по search bar ({search_x}, {search_y})")
+                self.page.mouse.click(search_x, search_y)
+                self.page.wait_for_timeout(1000)
+                search_clicked = True
+        except Exception as e:
+            self._emit(f"Ошибка клика по search: {e}")
+        
+        if not search_clicked:
+            self._emit("Не удалось кликнуть по search bar")
+            return False
+        
+        # 4. Ждём появления Xbox диалога с полем ввода
+        self._emit("Ожидаю появление диалога ввода...")
+        self.page.wait_for_timeout(1500)
+        
+        # 5. Ввести код острова
+        # Пробуем несколько способов ввода
+        self._emit(f"Ввожу код острова: {code}")
+        
+        # Способ 1: Просто печатаем (если фокус уже в поле)
+        try:
+            self.page.keyboard.type(code, delay=50)
+            self.page.wait_for_timeout(500)
+        except Exception as e:
+            self._emit(f"Ошибка ввода: {e}")
+        
+        # 6. Нажать кнопку "ODESLAT" (отправить)
+        self._emit("Нажимаю ODESLAT (отправить)...")
+        
+        # Пробуем найти кнопку через DOM
+        odeslat_clicked = False
+        try:
+            # Кнопка ODESLAT обычно зелёная/синяя под полем ввода
+            btn = self.page.locator('button:has-text("ODESLAT"), button:has-text("Odeslat"), button:has-text("Send"), button:has-text("Submit")').first
+            if btn and btn.is_visible(timeout=2000):
+                btn.click()
+                odeslat_clicked = True
+                self._emit("Кнопка ODESLAT найдена и нажата")
+        except Exception:
+            pass
+        
+        if not odeslat_clicked:
+            # Fallback: Enter
+            self._emit("Кнопка ODESLAT не найдена, нажимаю Enter")
+            self.page.keyboard.press('Enter')
+        
+        self.page.wait_for_timeout(2000)
+        
+        # 7. Кликнуть на первую карту в результатах
+        self._emit("Выбираю первую карту в результатах...")
+        try:
+            if bounds:
+                # Первая карта обычно в левой части под search bar
+                # Примерно 10-30% слева, 30-50% сверху
+                card_x = cx + int(cw * 0.15)  # 15% слева
+                card_y = cy + int(ch * 0.45)  # 45% сверху
+                
+                self._emit(f"Кликаю по первой карте ({card_x}, {card_y})")
+                self.page.mouse.click(card_x, card_y)
+                self.page.wait_for_timeout(1500)
+        except Exception as e:
+            self._emit(f"Ошибка клика по карте: {e}")
+        
+        # 8. Нажать желтую кнопку "SELECT"
+        self._emit("Ищу и нажимаю кнопку SELECT...")
+        select_clicked = False
+        
+        try:
+            # Кнопка SELECT обычно желтая в нижней левой части
+            btn = self.page.locator('button:has-text("SELECT"), button:has-text("Select"), button:has-text("VYBRAT")').first
+            if btn and btn.is_visible(timeout=3000):
+                btn.click()
+                select_clicked = True
+                self._emit("Кнопка SELECT найдена и нажата")
+        except Exception:
+            pass
+        
+        if not select_clicked:
+            # Fallback: координаты
+            if bounds:
+                # SELECT обычно внизу слева
+                select_x = cx + int(cw * 0.20)
+                select_y = cy + int(ch * 0.80)
+                self._emit(f"Кликаю по координатам SELECT ({select_x}, {select_y})")
+                self.page.mouse.click(select_x, select_y)
+        
+        self.page.wait_for_timeout(2000)
+        
+        # 9. Нажать кнопку "PLAY"
+        self._emit("Ищу и нажимаю кнопку PLAY...")
+        play_clicked = False
+        
+        try:
+            btn = self.page.locator('button:has-text("PLAY"), button:has-text("Play"), button:has-text("HRÁT")').first
+            if btn and btn.is_visible(timeout=3000):
+                btn.click()
+                play_clicked = True
+                self._emit("Кнопка PLAY найдена и нажата")
+        except Exception:
+            pass
+        
+        if not play_clicked:
+            # Fallback: координаты
+            if bounds:
+                # PLAY обычно внизу слева (та же область что SELECT)
+                play_x = cx + int(cw * 0.20)
+                play_y = cy + int(ch * 0.80)
+                self._emit(f"Кликаю по координатам PLAY ({play_x}, {play_y})")
+                self.page.mouse.click(play_x, play_y)
+        
+        self.page.wait_for_timeout(1000)
+        
+        self._emit("Остров запущен через Xbox метод!")
         return True
     
     # ========================================================================

@@ -64,8 +64,9 @@ def _save_debug_image(img: np.ndarray, state: str, info: dict = None):
                 cv2.putText(debug_img, text, (10, y_offset), font, 0.5, (255, 255, 0), 1)
                 y_offset += 25
         
-        # Сохраняем
-        filename = f"{datetime.now().strftime('%H%M%S')}_{state}.jpg"
+        # Сохраняем с уникальным именем (включая миллисекунды)
+        timestamp = datetime.now().strftime('%H%M%S_%f')[:13]  # HHMMSS_mmm
+        filename = f"{timestamp}_{state}.jpg"
         filepath = os.path.join(_DEBUG_DIR, filename)
         cv2.imwrite(filepath, debug_img)
         
@@ -420,13 +421,17 @@ def _detect_title_screen(img: np.ndarray) -> bool:
 
 def _detect_fortnite_lobby(img: np.ndarray) -> bool:
     """
-    Детектирует лобби Fortnite.
+    Детектирует лобби Fortnite (включая экран Discover/Search).
     
     Характерные признаки лобби:
-    - Жёлтая кнопка "PLAY" в нижней центральной части экрана
-    - Персонаж в центре
-    - UI элементы вверху (вкладки меню)
-    - Иконка поиска (лупа) в верхней левой части
+    - Панель вкладок вверху: "PLAY SHOP LOCKER PASSES QUESTS COMPETE CAREER V-BUCKS"
+    - Белый текст "PLAY" в верхнем левом углу
+    - Жёлтая/оранжевая кнопка PLAY в нижней части экрана (основное лобби)
+    - ИЛИ белая кнопка DISCOVER справа вверху (экран поиска)
+    - Персонаж в центре (основное лобби)
+    - НЕ тёмный экран загрузки
+    
+    ВАЖНО: Экран Discover тоже считается лобби!
     """
     try:
         h, w = img.shape[:2]
@@ -435,39 +440,80 @@ def _detect_fortnite_lobby(img: np.ndarray) -> bool:
         
         mean_brightness = np.mean(gray)
         
-        # Лобби яркое (не тёмная загрузка)
-        if mean_brightness < 50:
+        # 1. ГЛАВНЫЙ ПРИЗНАК: Панель вкладок в верхней части (белый текст)
+        # Область: верхние 12% экрана, левая половина (там PLAY SHOP LOCKER...)
+        top_left = img[int(h*0.02):int(h*0.12), int(w*0.05):int(w*0.65)]
+        top_left_gray = cv2.cvtColor(top_left, cv2.COLOR_BGR2GRAY)
+        
+        # Ищем яркие (белые) пиксели в этой области - это текст вкладок
+        white_text_mask = top_left_gray > 200
+        white_text_ratio = np.count_nonzero(white_text_mask) / white_text_mask.size
+        
+        # Проверяем контраст (должны быть чёткие границы текста)
+        top_edges = cv2.Canny(top_left_gray, 100, 200)
+        top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
+        
+        _log_debug(f"_detect_fortnite_lobby: brightness={mean_brightness:.1f}, top white={white_text_ratio:.4f}, edges={top_edge_ratio:.4f}")
+        
+        # Если в верхней части есть белый текст и контрастные границы - вероятно это меню лобби
+        has_top_menu = white_text_ratio > 0.03 and top_edge_ratio > 0.02
+        
+        # Если есть верхнее меню - это уже хороший признак лобби/discover
+        # Даже если экран тёмный (Discover screen)
+        
+        # 2. Проверяем DISCOVER экран (тёмно-синий фон с меню вверху)
+        # Характеристика: brightness 20-60, но есть белое меню вверху
+        if mean_brightness > 15 and mean_brightness < 70:
+            # Это может быть Discover экран
+            # Проверяем есть ли белая кнопка DISCOVER справа вверху
+            top_right = img[int(h*0.06):int(h*0.15), int(w*0.45):int(w*0.65)]
+            top_right_gray = cv2.cvtColor(top_right, cv2.COLOR_BGR2GRAY)
+            bright_pixels = top_right_gray > 200
+            discover_btn_ratio = np.count_nonzero(bright_pixels) / bright_pixels.size
+            
+            _log_debug(f"_detect_fortnite_lobby: discover_btn_ratio={discover_btn_ratio:.4f}")
+            
+            # Если есть меню вверху + светлая кнопка DISCOVER - это Discover экран
+            if has_top_menu and discover_btn_ratio > 0.03:
+                _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (Discover экран)")
+                return True
+        
+        # Слишком тёмный экран (< 15) - это точно загрузка
+        if mean_brightness < 15:
+            _log_debug(f"_detect_fortnite_lobby: слишком тёмный ({mean_brightness:.1f}) - НЕ лобби")
             return False
         
-        # 1. Ищем жёлтую кнопку PLAY в нижней центральной части
-        # Жёлтый в HSV: H=20-40, высокая насыщенность и яркость
-        bottom_center = img[int(h*0.7):int(h*0.95), int(w*0.3):int(w*0.7)]
+        # 3. Ищем жёлтую/оранжевую кнопку PLAY в нижней центральной части
+        # (Это большая кнопка для запуска матча - основное лобби)
+        bottom_center = img[int(h*0.70):int(h*0.95), int(w*0.05):int(w*0.45)]
         bottom_hsv = cv2.cvtColor(bottom_center, cv2.COLOR_BGR2HSV)
         
+        # Жёлтый/оранжевый в HSV
         yellow_lower = np.array([15, 100, 150], dtype=np.uint8)
         yellow_upper = np.array([45, 255, 255], dtype=np.uint8)
         mask_yellow = cv2.inRange(bottom_hsv, yellow_lower, yellow_upper)
         yellow_ratio = np.count_nonzero(mask_yellow) / mask_yellow.size
         
-        # Если есть существенная жёлтая область снизу - вероятно кнопка PLAY
-        if yellow_ratio > 0.02:  # Минимум 2% жёлтого в нижней центральной части
-            _log_debug(f"_detect_fortnite_lobby: yellow_ratio={yellow_ratio:.4f} в нижней части - вероятно кнопка PLAY")
+        _log_debug(f"_detect_fortnite_lobby: bottom yellow_ratio={yellow_ratio:.4f}")
+        
+        has_play_button = yellow_ratio > 0.01  # Минимум 1% жёлтого внизу
+        
+        # 4. Финальная проверка для основного лобби (с персонажем)
+        if has_top_menu and has_play_button:
+            _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (меню + кнопка PLAY)")
             return True
         
-        # 2. Альтернатива: ищем яркую UI панель вверху с вкладками
-        top_ui = img[0:int(h*0.15), :]
-        top_gray = cv2.cvtColor(top_ui, cv2.COLOR_BGR2GRAY)
-        top_brightness = np.mean(top_gray)
-        
-        # Ищем контрастные элементы в верхней части (вкладки меню)
-        top_edges = cv2.Canny(top_gray, 50, 150)
-        top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
-        
-        # Много контраста вверху + средняя яркость = вероятно UI лобби
-        if top_edge_ratio > 0.05 and top_brightness > 80 and mean_brightness > 80:
-            _log_debug(f"_detect_fortnite_lobby: top_edges={top_edge_ratio:.4f}, top_bright={top_brightness:.1f} - вероятно UI лобби")
+        # Если очень сильное меню вверху (много белого текста) - тоже считаем лобби
+        if white_text_ratio > 0.06 and top_edge_ratio > 0.04:
+            _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (сильное меню)")
             return True
         
+        # 5. Fallback: если есть меню вверху и экран не совсем тёмный
+        if has_top_menu and mean_brightness > 30:
+            _log_debug(f"_detect_fortnite_lobby: ОБНАРУЖЕНО (есть меню, brightness={mean_brightness:.1f})")
+            return True
+        
+        _log_debug("_detect_fortnite_lobby: НЕ обнаружено")
         return False
     except Exception as e:
         _log_debug(f"_detect_fortnite_lobby error: {e}")
@@ -727,11 +773,24 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     
     _log_debug(f"Анализ экрана: размер={w}x{h}, яркость={mean_brightness:.1f}, контраст={std_brightness:.1f}")
     
-    # ВАЖНО: Если экран яркий (>100) - это точно НЕ игровая загрузка
-    # Это может быть страница Xbox сайта
-    if mean_brightness > 100:
-        debug_info["note"] = "Яркий экран - сайт Xbox"
-        _log_debug(f"  Яркий экран (brightness={mean_brightness:.1f}) - пропускаем CONNECTING/LOADING")
+    # ВСЕГДА сохраняем debug скриншот в начале анализа
+    if _VISION_DEBUG:
+        _save_debug_image(img, "ANALYZING", debug_info)
+    
+    # ВАЖНО: Проверяем лобби Fortnite ПЕРВЫМ - даже на ярких экранах
+    # Это важно потому что лобби с персонажем имеет brightness 100-120
+    is_lobby = _detect_fortnite_lobby(img)
+    debug_info["lobby_check"] = str(is_lobby)
+    _log_debug(f"  Проверка FORTNITE_LOBBY (первичная): {is_lobby}")
+    if is_lobby:
+        _log_info("Состояние: LOBBY (лобби Fortnite)")
+        _save_debug_image(img, "LOBBY", debug_info)
+        return ScreenState.LOBBY
+    
+    # ВАЖНО: Если экран ОЧЕНЬ яркий (>130) и это НЕ лобби - это может быть страница Xbox
+    if mean_brightness > 130:
+        debug_info["note"] = "Очень яркий экран - возможно сайт Xbox"
+        _log_debug(f"  Очень яркий экран (brightness={mean_brightness:.1f})")
         
         # Проверяем страницу входа Microsoft
         white_lower = np.array([0, 0, 200], dtype=np.uint8)
@@ -751,8 +810,8 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
                 _save_debug_image(img, "LOGIN_PAGE", debug_info)
                 return ScreenState.LOGIN_PAGE
         
-        # Яркий экран но не login - это UNKNOWN (страница сайта Xbox)
-        _log_debug("  Состояние: UNKNOWN (яркий экран, вероятно сайт Xbox)")
+        # Очень яркий экран но не login и не лобби - UNKNOWN
+        _log_debug("  Состояние: UNKNOWN (очень яркий экран)")
         _save_debug_image(img, "UNKNOWN_BRIGHT", debug_info)
         return ScreenState.UNKNOWN
     
