@@ -1470,11 +1470,28 @@ class CanvasNavigator:
             self.page.keyboard.press('ArrowDown')
     
     def _click_search_bar(self, cx, cy, cw, ch):
-        """Клик по Search Discover бару."""
-        # Search bar находится слева вверху (~15%, 7%)
+        """Клик по Search Discover бару с поиском по шаблону."""
+        from ..vision.capture import capture_page_bgr
+        from ..vision.template_nav import find_search_discover_bar
+        
+        # Пробуем найти по шаблону
+        try:
+            img = capture_page_bgr(self.page)
+            match = find_search_discover_bar(img)
+            if match:
+                click_x = cx + match.center[0]
+                click_y = cy + match.center[1]
+                self._log_input("CLICK", f"({click_x}, {click_y})", f"Search bar найден по шаблону (conf={match.confidence:.2f})")
+                self._emit(f"🎯 Search bar найден! Клик ({click_x}, {click_y})")
+                self.page.mouse.click(click_x, click_y)
+                return
+        except Exception as e:
+            self._emit(f"Ошибка поиска шаблона: {e}")
+        
+        # Fallback: Search bar находится слева вверху (~15%, 7%)
         search_x = cx + int(cw * 0.15)
         search_y = cy + int(ch * 0.07)
-        self._log_input("CLICK", f"({search_x}, {search_y})", "Search Discover bar")
+        self._log_input("CLICK", f"({search_x}, {search_y})", "Search Discover bar (fallback)")
         self.page.mouse.click(search_x, search_y)
     
     def _enter_island_code(self, code: str):
@@ -1491,27 +1508,78 @@ class CanvasNavigator:
         self.page.keyboard.press('Enter')
     
     def _click_island_card(self, cx, cy, cw, ch):
-        """Клик по карте острова в результатах."""
-        # Карта обычно слева по центру (~25%, 50%)
+        """Клик по карте острова в результатах с поиском по шаблону."""
+        from ..vision.capture import capture_page_bgr
+        from ..vision.template_nav import find_island_card
+        
+        # Пробуем найти по шаблону
+        try:
+            img = capture_page_bgr(self.page)
+            match = find_island_card(img)
+            if match:
+                click_x = cx + match.center[0]
+                click_y = cy + match.center[1]
+                self._log_input("CLICK", f"({click_x}, {click_y})", f"Карта найдена по шаблону (conf={match.confidence:.2f})")
+                self._emit(f"🎯 Карта острова найдена! Клик ({click_x}, {click_y})")
+                self.page.mouse.click(click_x, click_y)
+                return
+        except Exception as e:
+            self._emit(f"Ошибка поиска шаблона: {e}")
+        
+        # Fallback: Карта обычно слева по центру (~25%, 50%)
         card_x = cx + int(cw * 0.25)
         card_y = cy + int(ch * 0.50)
-        self._log_input("CLICK", f"({card_x}, {card_y})", "карта острова")
+        self._log_input("CLICK", f"({card_x}, {card_y})", "карта острова (fallback)")
         self.page.mouse.click(card_x, card_y)
     
     def _click_select_button(self, cx, cy, cw, ch):
-        """Клик по кнопке SELECT."""
-        # SELECT внизу по центру (~50%, 85%)
+        """Клик по кнопке SELECT с поиском по шаблону."""
+        from ..vision.capture import capture_page_bgr
+        from ..vision.template_nav import find_select_button
+        
+        # Пробуем найти по шаблону
+        try:
+            img = capture_page_bgr(self.page)
+            match = find_select_button(img)
+            if match:
+                click_x = cx + match.center[0]
+                click_y = cy + match.center[1]
+                self._log_input("CLICK", f"({click_x}, {click_y})", f"SELECT найдена по шаблону (conf={match.confidence:.2f})")
+                self._emit(f"🎯 Кнопка SELECT найдена! Клик ({click_x}, {click_y})")
+                self.page.mouse.click(click_x, click_y)
+                return
+        except Exception as e:
+            self._emit(f"Ошибка поиска шаблона: {e}")
+        
+        # Fallback: SELECT внизу по центру (~50%, 85%)
         btn_x = cx + int(cw * 0.50)
         btn_y = cy + int(ch * 0.85)
-        self._log_input("CLICK", f"({btn_x}, {btn_y})", "кнопка SELECT")
+        self._log_input("CLICK", f"({btn_x}, {btn_y})", "кнопка SELECT (fallback)")
         self.page.mouse.click(btn_x, btn_y)
     
     def _click_play_button(self, cx, cy, cw, ch):
-        """Клик по кнопке PLAY."""
-        # PLAY внизу по центру (~50%, 85%) - та же позиция что SELECT
+        """Клик по кнопке PLAY с поиском по шаблону."""
+        from ..vision.capture import capture_page_bgr
+        from ..vision.template_nav import find_play_button
+        
+        # Пробуем найти по шаблону
+        try:
+            img = capture_page_bgr(self.page)
+            match = find_play_button(img)
+            if match:
+                click_x = cx + match.center[0]
+                click_y = cy + match.center[1]
+                self._log_input("CLICK", f"({click_x}, {click_y})", f"PLAY найдена по шаблону (conf={match.confidence:.2f})")
+                self._emit(f"🎯 Кнопка PLAY найдена! Клик ({click_x}, {click_y})")
+                self.page.mouse.click(click_x, click_y)
+                return
+        except Exception as e:
+            self._emit(f"Ошибка поиска шаблона: {e}")
+        
+        # Fallback: PLAY внизу по центру (~50%, 85%) - та же позиция что SELECT
         btn_x = cx + int(cw * 0.50)
         btn_y = cy + int(ch * 0.85)
-        self._log_input("CLICK", f"({btn_x}, {btn_y})", "кнопка PLAY")
+        self._log_input("CLICK", f"({btn_x}, {btn_y})", "кнопка PLAY (fallback)")
         self.page.mouse.click(btn_x, btn_y)
     
     # ========================================================================
