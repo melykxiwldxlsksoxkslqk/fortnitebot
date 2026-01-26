@@ -426,12 +426,13 @@ def _detect_xbox_queue(img: np.ndarray) -> bool:
 
 def _detect_title_screen(img: np.ndarray) -> bool:
     """
-    Детектирует титульный экран Fortnite.
+    Детектирует титульный экран Fortnite ("Press any key to continue").
     
     Характеристики:
-    - Яркое изображение (не тёмный экран загрузки)
-    - Много фиолетовых/пурпурных тонов (типичная цветовая схема Fortnite)
-    - Возможно надпись FORTNITE в верхней части (белая)
+    - Яркое изображение (много фиолетовых/пурпурных тонов)
+    - Надпись FORTNITE в верхней части (белая)
+    - НЕТ верхнего меню (PLAY SHOP LOCKER...) - это ключевое отличие от лобби!
+    - Обычно есть текст "Press any key" внизу
     """
     try:
         h, w = img.shape[:2]
@@ -444,51 +445,68 @@ def _detect_title_screen(img: np.ndarray) -> bool:
         if mean_brightness < 60:
             return False
         
-        # Проверяем наличие фиолетовых/пурпурных тонов (характерно для Fortnite)
-        # Фиолетовый в HSV: H=125-155, высокая насыщенность
+        # КЛЮЧЕВОЕ ОТЛИЧИЕ от лобби: НЕТ верхнего меню с текстом "PLAY SHOP LOCKER..."
+        # В лобби меню занимает верхние 5-12% экрана слева с белым текстом
+        # На титульном экране там обычно логотип FORTNITE или пустое пространство
+        top_menu_roi = gray[int(h*0.02):int(h*0.10), int(w*0.10):int(w*0.60)]
+        top_menu_white = np.count_nonzero(top_menu_roi > 200) / top_menu_roi.size
+        top_menu_edges = cv2.Canny(top_menu_roi, 100, 200)
+        top_menu_edge_ratio = np.count_nonzero(top_menu_edges) / top_menu_edges.size
+        
+        # Если много белого текста в верхнем меню (>3%) и много границ (>2%) - это лобби, НЕ title screen
+        has_top_menu = top_menu_white > 0.03 and top_menu_edge_ratio > 0.02
+        
+        _log_debug(f"_detect_title_screen: brightness={mean_brightness:.1f}, top_menu_white={top_menu_white:.4f}, edge_ratio={top_menu_edge_ratio:.4f}, has_menu={has_top_menu}")
+        
+        if has_top_menu:
+            _log_debug("_detect_title_screen: НЕТ - есть верхнее меню (это лобби)")
+            return False
+        
+        # Проверяем наличие фиолетовых/пурпурных тонов (характерно для Title Screen Fortnite)
+        # Фиолетовый в HSV: H=125-165, высокая насыщенность
         purple_lower = np.array([120, 30, 50], dtype=np.uint8)
         purple_upper = np.array([165, 255, 255], dtype=np.uint8)
         mask_purple = cv2.inRange(hsv, purple_lower, purple_upper)
         purple_ratio = np.count_nonzero(mask_purple) / mask_purple.size
         
-        # Если много фиолетового - скорее всего титульный экран Fortnite
+        _log_debug(f"_detect_title_screen: purple_ratio={purple_ratio:.4f}")
+        
+        # Если много фиолетового (>5%) и НЕТ верхнего меню - это Title Screen
         if purple_ratio > 0.05:
+            _log_debug("_detect_title_screen: ДА - много фиолетового, нет меню")
             return True
         
-        # Также проверяем на яркие разноцветные области (персонажи, эффекты)
-        # Высокая насыщенность и яркость
-        colorful_lower = np.array([0, 80, 100], dtype=np.uint8)
-        colorful_upper = np.array([180, 255, 255], dtype=np.uint8)
-        mask_colorful = cv2.inRange(hsv, colorful_lower, colorful_upper)
-        colorful_ratio = np.count_nonzero(mask_colorful) / mask_colorful.size
+        # Также проверяем яркие разноцветные области + белый текст сверху (логотип FORTNITE)
+        # Верхняя центральная часть - там обычно большой белый логотип
+        top_center_roi = gray[int(h*0.05):int(h*0.25), int(w*0.25):int(w*0.75)]
+        white_logo = np.count_nonzero(top_center_roi > 220) / top_center_roi.size
         
-        # Проверяем верхнюю часть экрана на наличие белого текста (FORTNITE)
-        top_roi = img[0:int(h*0.25), int(w*0.2):int(w*0.8)]
-        top_gray = cv2.cvtColor(top_roi, cv2.COLOR_BGR2GRAY)
-        white_pixels = np.sum(top_gray > 200) / top_gray.size
+        _log_debug(f"_detect_title_screen: white_logo={white_logo:.4f}")
         
-        # Комбинация: много цветного + белый текст сверху
-        if colorful_ratio > 0.2 and white_pixels > 0.02:
+        # Большой белый логотип (>8%) + яркий экран + нет верхнего меню
+        if white_logo > 0.08 and mean_brightness > 80:
+            _log_debug("_detect_title_screen: ДА - большой белый логотип")
             return True
         
+        _log_debug("_detect_title_screen: НЕТ")
         return False
-    except Exception:
+    except Exception as e:
+        _log_debug(f"_detect_title_screen error: {e}")
         return False
 
 
 def _detect_fortnite_lobby(img: np.ndarray) -> bool:
     """
-    Детектирует лобби Fortnite (включая экран Discover/Search).
+    Детектирует ОСНОВНОЕ лобби Fortnite с персонажем в центре.
     
-    Характерные признаки лобби:
+    Характерные признаки:
     - Панель вкладок вверху: "PLAY SHOP LOCKER PASSES QUESTS COMPETE CAREER V-BUCKS"
-    - Белый текст "PLAY" в верхнем левом углу
-    - Жёлтая/оранжевая кнопка PLAY в нижней части экрана (основное лобби)
-    - ИЛИ белая кнопка DISCOVER справа вверху (экран поиска)
-    - Персонаж в центре (основное лобби)
-    - НЕ тёмный экран загрузки
+    - Персонаж в центре экрана (высокий контраст, человеческие пропорции)
+    - Карусель игр внизу (яркие карточки)
+    - Жёлтая кнопка PLAY слева внизу
+    - ЯРКИЙ экран (brightness > 40)
     
-    ВАЖНО: Экран Discover тоже считается лобби!
+    ВАЖНО: Это НЕ Discover! У Discover тёмный фон и Search bar.
     """
     try:
         h, w = img.shape[:2]
@@ -497,77 +515,60 @@ def _detect_fortnite_lobby(img: np.ndarray) -> bool:
         
         mean_brightness = np.mean(gray)
         
-        # 1. ГЛАВНЫЙ ПРИЗНАК: Панель вкладок в верхней части (белый текст)
-        # Область: верхние 12% экрана, левая половина (там PLAY SHOP LOCKER...)
+        # ЛОББИ с персонажем ЯРКОЕ (> 40), DISCOVER тёмный (< 60)
+        # Это ключевое отличие!
+        if mean_brightness < 40:
+            _log_debug(f"_detect_fortnite_lobby: слишком тёмный ({mean_brightness:.1f}) - это может быть Discover")
+            return False
+        
+        # 1. Проверяем верхнее меню (PLAY SHOP LOCKER...)
         top_left = img[int(h*0.02):int(h*0.12), int(w*0.05):int(w*0.65)]
         top_left_gray = cv2.cvtColor(top_left, cv2.COLOR_BGR2GRAY)
-        
-        # Ищем яркие (белые) пиксели в этой области - это текст вкладок
         white_text_mask = top_left_gray > 200
         white_text_ratio = np.count_nonzero(white_text_mask) / white_text_mask.size
-        
-        # Проверяем контраст (должны быть чёткие границы текста)
         top_edges = cv2.Canny(top_left_gray, 100, 200)
         top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
         
-        _log_debug(f"_detect_fortnite_lobby: brightness={mean_brightness:.1f}, top white={white_text_ratio:.4f}, edges={top_edge_ratio:.4f}")
-        
-        # Если в верхней части есть белый текст и контрастные границы - вероятно это меню лобби
         has_top_menu = white_text_ratio > 0.03 and top_edge_ratio > 0.02
         
-        # Если есть верхнее меню - это уже хороший признак лобби/discover
-        # Даже если экран тёмный (Discover screen)
+        _log_debug(f"_detect_fortnite_lobby: brightness={mean_brightness:.1f}, menu_white={white_text_ratio:.4f}, edges={top_edge_ratio:.4f}")
         
-        # 2. Проверяем DISCOVER экран (тёмно-синий фон с меню вверху)
-        # Характеристика: brightness 20-60, но есть белое меню вверху
-        if mean_brightness > 15 and mean_brightness < 70:
-            # Это может быть Discover экран
-            # Проверяем есть ли белая кнопка DISCOVER справа вверху
-            top_right = img[int(h*0.06):int(h*0.15), int(w*0.45):int(w*0.65)]
-            top_right_gray = cv2.cvtColor(top_right, cv2.COLOR_BGR2GRAY)
-            bright_pixels = top_right_gray > 200
-            discover_btn_ratio = np.count_nonzero(bright_pixels) / bright_pixels.size
-            
-            _log_debug(f"_detect_fortnite_lobby: discover_btn_ratio={discover_btn_ratio:.4f}")
-            
-            # Если есть меню вверху + светлая кнопка DISCOVER - это Discover экран
-            if has_top_menu and discover_btn_ratio > 0.03:
-                _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (Discover экран)")
-                return True
-        
-        # Слишком тёмный экран (< 15) - это точно загрузка
-        if mean_brightness < 15:
-            _log_debug(f"_detect_fortnite_lobby: слишком тёмный ({mean_brightness:.1f}) - НЕ лобби")
+        if not has_top_menu:
+            _log_debug("_detect_fortnite_lobby: нет верхнего меню - НЕ лобби")
             return False
         
-        # 3. Ищем жёлтую/оранжевую кнопку PLAY в нижней центральной части
-        # (Это большая кнопка для запуска матча - основное лобби)
-        bottom_center = img[int(h*0.70):int(h*0.95), int(w*0.05):int(w*0.45)]
-        bottom_hsv = cv2.cvtColor(bottom_center, cv2.COLOR_BGR2HSV)
+        # 2. Проверяем персонажа в центре экрана
+        # Центральная область (30-70% по ширине, 20-75% по высоте)
+        center_roi = gray[int(h*0.20):int(h*0.75), int(w*0.30):int(w*0.70)]
+        center_std = np.std(center_roi)
+        center_mean = np.mean(center_roi)
         
-        # Жёлтый/оранжевый в HSV
+        # Персонаж создаёт контраст (std > 30) и не слишком тёмный (mean > 50)
+        has_character = center_std > 30 and center_mean > 50
+        
+        _log_debug(f"_detect_fortnite_lobby: center_std={center_std:.1f}, center_mean={center_mean:.1f}, has_char={has_character}")
+        
+        # 3. Проверяем карусель игр внизу (яркие карточки)
+        bottom_roi = gray[int(h*0.80):, int(w*0.05):int(w*0.95)]
+        bottom_std = np.std(bottom_roi)
+        has_carousel = bottom_std > 35
+        
+        _log_debug(f"_detect_fortnite_lobby: bottom_std={bottom_std:.1f}, has_carousel={has_carousel}")
+        
+        # 4. Ищем жёлтую кнопку PLAY слева внизу
+        bottom_left = img[int(h*0.70):int(h*0.95), int(w*0.05):int(w*0.40)]
+        bottom_left_hsv = cv2.cvtColor(bottom_left, cv2.COLOR_BGR2HSV)
         yellow_lower = np.array([15, 100, 150], dtype=np.uint8)
         yellow_upper = np.array([45, 255, 255], dtype=np.uint8)
-        mask_yellow = cv2.inRange(bottom_hsv, yellow_lower, yellow_upper)
+        mask_yellow = cv2.inRange(bottom_left_hsv, yellow_lower, yellow_upper)
         yellow_ratio = np.count_nonzero(mask_yellow) / mask_yellow.size
+        has_play_button = yellow_ratio > 0.005
         
-        _log_debug(f"_detect_fortnite_lobby: bottom yellow_ratio={yellow_ratio:.4f}")
+        _log_debug(f"_detect_fortnite_lobby: yellow_ratio={yellow_ratio:.4f}, has_play={has_play_button}")
         
-        has_play_button = yellow_ratio > 0.01  # Минимум 1% жёлтого внизу
-        
-        # 4. Финальная проверка для основного лобби (с персонажем)
-        if has_top_menu and has_play_button:
-            _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (меню + кнопка PLAY)")
-            return True
-        
-        # Если очень сильное меню вверху (много белого текста) - тоже считаем лобби
-        if white_text_ratio > 0.06 and top_edge_ratio > 0.04:
-            _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (сильное меню)")
-            return True
-        
-        # 5. Fallback: если есть меню вверху и экран не совсем тёмный
-        if has_top_menu and mean_brightness > 30:
-            _log_debug(f"_detect_fortnite_lobby: ОБНАРУЖЕНО (есть меню, brightness={mean_brightness:.1f})")
+        # Финальная проверка: меню + (персонаж ИЛИ карусель ИЛИ play button)
+        if has_top_menu and (has_character or has_carousel or has_play_button):
+            _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (лобби с персонажем)")
             return True
         
         _log_debug("_detect_fortnite_lobby: НЕ обнаружено")
@@ -950,7 +951,9 @@ def _detect_lobby_with_character(img: np.ndarray) -> bool:
     """
     Детектирует лобби Fortnite именно с персонажем в центре.
     
-    Отличие от DISCOVER: есть крупный персонаж в центре экрана.
+    Отличие от DISCOVER: 
+    - Есть крупный персонаж в центре экрана
+    - ЯРКИЙ экран (brightness > 40) - у Discover тёмный фон
     """
     try:
         h, w = img.shape[:2]
@@ -958,8 +961,22 @@ def _detect_lobby_with_character(img: np.ndarray) -> bool:
         
         mean_brightness = np.mean(gray)
         
-        # Лобби с персонажем обычно яркое (70-130)
-        if mean_brightness < 50 or mean_brightness > 150:
+        # КЛЮЧЕВОЕ: Лобби с персонажем ЯРКОЕ (>40)!
+        # Discover тёмный (20-60), тут мы хотим яркий экран
+        if mean_brightness < 40 or mean_brightness > 150:
+            _log_debug(f"_detect_lobby_character: brightness={mean_brightness:.1f} - не подходит (нужно 40-150)")
+            return False
+        
+        # Проверяем верхнее меню (PLAY, SHOP, LOCKER...)
+        top_roi = gray[int(h*0.02):int(h*0.10), int(w*0.10):int(w*0.60)]
+        top_white = np.count_nonzero(top_roi > 200) / top_roi.size
+        top_edges = cv2.Canny(top_roi, 100, 200)
+        top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
+        
+        has_menu = top_white > 0.02 and top_edge_ratio > 0.01
+        
+        if not has_menu:
+            _log_debug(f"_detect_lobby_character: нет меню - НЕ лобби")
             return False
         
         # Центральная область (где персонаж)
@@ -971,22 +988,18 @@ def _detect_lobby_with_character(img: np.ndarray) -> bool:
         bottom_roi = gray[int(h*0.80):, int(w*0.10):int(w*0.90)]
         bottom_std = np.std(bottom_roi)
         
-        _log_debug(f"_detect_lobby_character: center_std={center_std:.1f}, center_mean={center_mean:.1f}, bottom_std={bottom_std:.1f}")
+        _log_debug(f"_detect_lobby_character: brightness={mean_brightness:.1f}, center_std={center_std:.1f}, center_mean={center_mean:.1f}, bottom_std={bottom_std:.1f}")
         
-        # Персонаж создаёт контраст в центре
-        # Также внизу есть карусель игр (контрастная)
-        has_character = center_std > 35 and center_mean > 60
-        has_carousel = bottom_std > 40
+        # Персонаж создаёт контраст в центре (std > 30) и центр не слишком тёмный (mean > 50)
+        has_character = center_std > 30 and center_mean > 50
         
-        # Проверяем верхнее меню (PLAY, SHOP, LOCKER...)
-        top_roi = gray[int(h*0.02):int(h*0.10), int(w*0.10):int(w*0.60)]
-        top_white = np.count_nonzero(top_roi > 200) / top_roi.size
-        
-        has_menu = top_white > 0.02
+        # Карусель игр создаёт контраст внизу (std > 35)
+        has_carousel = bottom_std > 35
         
         _log_debug(f"_detect_lobby_character: has_menu={has_menu}, has_character={has_character}, has_carousel={has_carousel}")
         
-        if has_menu and has_character:
+        # Нужно меню + (персонаж ИЛИ карусель)
+        if has_menu and (has_character or has_carousel):
             _log_debug("_detect_lobby_character: ОБНАРУЖЕНО")
             return True
         
@@ -1133,13 +1146,17 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     if _VISION_DEBUG:
         _save_debug_image(img, "ANALYZING", debug_info)
     
-    # ВАЖНО: Сначала проверяем LOBBY и TITLE_SCREEN, потом специфичные состояния
-    # Это критично потому что island preview детектор может ложно срабатывать на лобби
+    # ПОРЯДОК ПРОВЕРКИ (критично!):
+    # 1. TITLE_SCREEN - яркий, фиолетовый, БЕЗ верхнего меню
+    # 2. LOBBY с персонажем - яркий (>40), меню + персонаж + карусель
+    # 3. DISCOVER - тёмный (<60), Search bar + карточки (перед общим lobby!)
+    # 4. LOBBY общий - яркий, меню + play button
+    # 5. Специфичные экраны (search input, results, preview)
     
-    # 1. Проверяем Title Screen (фиолетовый экран с логотипом FORTNITE)
+    # 1. Проверяем Title Screen (фиолетовый экран БЕЗ верхнего меню)
     is_title = _detect_title_screen(img)
     debug_info["title_check"] = str(is_title)
-    _log_debug(f"  Проверка TITLE_SCREEN (первичная): {is_title}")
+    _log_debug(f"  Проверка TITLE_SCREEN: {is_title}")
     if is_title:
         _log_detection_result("TITLE_SCREEN", "титульный экран Fortnite", base_metrics)
         _save_debug_image(img, "TITLE_SCREEN", debug_info)
@@ -1148,23 +1165,14 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     # 2. Проверяем лобби с персонажем (яркий экран, меню вверху, персонаж в центре)
     is_lobby_char = _detect_lobby_with_character(img)
     debug_info["lobby_char_check"] = str(is_lobby_char)
-    _log_debug(f"  Проверка LOBBY (персонаж, первичная): {is_lobby_char}")
+    _log_debug(f"  Проверка LOBBY (с персонажем): {is_lobby_char}")
     if is_lobby_char:
         _log_detection_result("LOBBY", "лобби Fortnite с персонажем", base_metrics)
         _save_debug_image(img, "LOBBY", debug_info)
         return ScreenState.LOBBY
     
-    # 3. Общая проверка лобби
-    is_lobby = _detect_fortnite_lobby(img)
-    debug_info["lobby_check"] = str(is_lobby)
-    _log_debug(f"  Проверка FORTNITE_LOBBY (первичная): {is_lobby}")
-    if is_lobby:
-        _log_detection_result("LOBBY", "лобби Fortnite", base_metrics)
-        _save_debug_image(img, "LOBBY", debug_info)
-        return ScreenState.LOBBY
-    
-    # 4. Проверяем Discover экран (Search Discover бар вверху)
-    # ПОСЛЕ проверки lobby
+    # 3. Проверяем Discover экран (тёмный фон, Search Discover бар вверху)
+    # ВАЖНО: ДО общей проверки lobby! У Discover тёмный фон, у lobby яркий.
     is_discover = _detect_discover_screen(img)
     debug_info["discover_check"] = str(is_discover)
     _log_debug(f"  Проверка DISCOVER: {is_discover}")
@@ -1172,6 +1180,15 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         _log_detection_result("DISCOVER", "экран Discover с Search баром", base_metrics)
         _save_debug_image(img, "DISCOVER", debug_info)
         return ScreenState.DISCOVER
+    
+    # 4. Общая проверка лобби (меню + play button)
+    is_lobby = _detect_fortnite_lobby(img)
+    debug_info["lobby_check"] = str(is_lobby)
+    _log_debug(f"  Проверка FORTNITE_LOBBY: {is_lobby}")
+    if is_lobby:
+        _log_detection_result("LOBBY", "лобби Fortnite", base_metrics)
+        _save_debug_image(img, "LOBBY", debug_info)
+        return ScreenState.LOBBY
     
     # 5. Проверяем Search Input Dialog (диалог ввода кода)
     is_search_input = _detect_search_input_dialog(img)

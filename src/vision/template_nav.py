@@ -290,6 +290,61 @@ def find_play_button(img: np.ndarray) -> Optional[TemplateMatch]:
     return None
 
 
+def find_like_button_empty(img: np.ndarray) -> Optional[TemplateMatch]:
+    """
+    Ищет ПУСТУЮ кнопку лайка (остров НЕ лайкнут).
+    
+    Обычно в правой части экрана на превью острова.
+    Пустое сердечко = нужно лайкнуть.
+    """
+    match = find_template(
+        img,
+        'like_button_empty.png',
+        threshold=0.6,
+        roi=(0.50, 0.20, 1.0, 0.70)  # Правая часть экрана
+    )
+    return match
+
+
+def find_like_button_filled(img: np.ndarray) -> Optional[TemplateMatch]:
+    """
+    Ищет ЗАПОЛНЕННУЮ кнопку лайка (остров УЖЕ лайкнут).
+    
+    Закрашенное сердечко = уже лайкнуто.
+    """
+    match = find_template(
+        img,
+        'like_button_filled.png',
+        threshold=0.6,
+        roi=(0.50, 0.20, 1.0, 0.70)  # Правая часть экрана
+    )
+    return match
+
+
+def is_island_liked(img: np.ndarray) -> bool:
+    """
+    Проверяет лайкнут ли остров.
+    
+    Returns:
+        True если остров уже лайкнут, False если нет или не удалось определить
+    """
+    # Ищем заполненный лайк
+    filled = find_like_button_filled(img)
+    if filled:
+        logger.info(f"💜 Остров ЛАЙКНУТ (conf={filled.confidence:.2f})")
+        return True
+    
+    # Ищем пустой лайк
+    empty = find_like_button_empty(img)
+    if empty:
+        logger.info(f"🤍 Остров НЕ лайкнут (conf={empty.confidence:.2f})")
+        return False
+    
+    # Не нашли ни один - считаем что уже лайкнут (чтобы не спамить)
+    logger.warning("⚠️ Кнопка лайка не найдена, пропускаем")
+    return True
+
+
 def find_input_field(img: np.ndarray) -> Optional[TemplateMatch]:
     """
     Ищет поле ввода кода острова.

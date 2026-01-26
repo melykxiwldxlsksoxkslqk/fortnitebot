@@ -1308,20 +1308,21 @@ class CanvasNavigator:
         self._emit("Остров запущен через Xbox метод!")
         return True
     
-    def smart_launch_island(self, code: str, max_attempts: int = 30) -> bool:
+    def smart_launch_island_gamepad(self, code: str, max_attempts: int = 40) -> bool:
         """
-        🧠 УМНАЯ навигация к острову на основе Vision.
+        🎮 УМНАЯ навигация к острову через ГЕЙМПАД на основе Vision.
         
-        Бот ВИДИТ экран и ПРИНИМАЕТ РЕШЕНИЯ что делать:
-        - LOBBY (персонаж) → скролл вниз
-        - DISCOVER (Search bar) → клик по Search
-        - SEARCH_INPUT (диалог ввода) → ввод кода + Enter
-        - SEARCH_RESULTS (карточки) → клик по карте
-        - ISLAND_PREVIEW (превью) → SELECT/PLAY
+        Полный флоу:
+        1. LOBBY (персонаж) → D-PAD DOWN (скролл к Discover)
+        2. DISCOVER (Search bar) → навигация + A (открыть диалог)
+        3. SEARCH_INPUT (диалог) → ввод кода + ODESLAT
+        4. SEARCH_RESULTS (карточка) → навигация + A (выбрать)
+        5. ISLAND_PREVIEW (превью) → проверить лайк → SELECT
+        6. LOBBY (остров выбран) → PLAY
         
         Args:
-            code: Код острова
-            max_attempts: Максимум попыток (каждая ~2 сек)
+            code: Код острова (например 9620-3395-1945)
+            max_attempts: Максимум попыток
             
         Returns:
             True если остров запущен
@@ -1329,8 +1330,13 @@ class CanvasNavigator:
         from ..vision.state import detect_screen_state, ScreenState as VisionState
         from ..vision.capture import capture_page_bgr
         
-        self._emit(f"🧠 Умный запуск острова: {code}")
-        self._log_input("START", f"SMART запуск острова {code}", "Vision-based навигация")
+        self._emit(f"🎮 Запуск острова через геймпад: {code}")
+        self._log_input("START", f"GAMEPAD запуск острова {code}", "Vision + Gamepad навигация")
+        
+        # Проверяем геймпад
+        if not self._gamepad or not self._gamepad.is_virtual:
+            self._emit("❌ Виртуальный геймпад недоступен!")
+            return False
         
         # Убедиться в фокусе
         if not self.ensure_focus():
@@ -1342,15 +1348,17 @@ class CanvasNavigator:
             self._emit("Не удалось получить размеры канваса")
             return False
         
-        cx, cy, cw, ch = bounds
-        
         # Состояние машины состояний
+        scrolled_to_discover = False
+        search_bar_clicked = False
         code_entered = False
-        card_clicked = False
-        select_clicked = False
+        card_selected = False
+        like_checked = False
+        select_pressed = False
+        returned_to_lobby = False
         
         for attempt in range(max_attempts):
-            # 1. Получаем текущее состояние экрана
+            # Получаем текущее состояние экрана
             try:
                 img = capture_page_bgr(self.page)
                 state = detect_screen_state(img, use_cache=False)
@@ -1363,224 +1371,160 @@ class CanvasNavigator:
             self._emit(f"👁️ [{attempt+1}/{max_attempts}] Вижу: {state_name}")
             self._log_input("VISION", state_name, f"попытка {attempt+1}")
             
-            # 2. Принимаем решение на основе состояния
+            # ===== ШАГ 1: LOBBY → скролл к Discover =====
+            if state == VisionState.LOBBY and not select_pressed:
+                # Если ещё не нажали SELECT - значит мы в начале, скроллим к Discover
+                if not scrolled_to_discover:
+                    self._emit("📍 [1/6] Лобби → D-PAD DOWN к Discover")
+                    self._gamepad_scroll_down()
+                    scrolled_to_discover = True
+                    self.page.wait_for_timeout(1000)
+                    continue
+                else:
+                    # Уже скроллили, но всё ещё видим LOBBY - пробуем ещё раз
+                    self._emit("📍 Всё ещё в лобби → ещё D-PAD DOWN")
+                    self._gamepad_scroll_down()
+                    self.page.wait_for_timeout(800)
+                    continue
             
-            if state == VisionState.LOBBY:
-                # Лобби с персонажем - скроллим вниз к Discover
-                self._emit("📍 Лобби → скролл вниз к Discover")
-                self._scroll_down_to_discover()
-                self.page.wait_for_timeout(800)
-                continue
-            
-            elif state == VisionState.DISCOVER:
-                # Экран Discover - кликаем по Search bar
-                self._emit("📍 Discover → клик по Search Discover")
-                self._click_search_bar(cx, cy, cw, ch)
+            # ===== ШАГ 2: DISCOVER → открыть Search диалог =====
+            elif state == VisionState.DISCOVER and not search_bar_clicked:
+                self._emit("📍 [2/6] Discover → навигация к Search bar + A")
+                # Search bar слева - навигация влево и вверх
+                self._gamepad.navigate_up(times=2, delay_ms=200)
+                self.page.wait_for_timeout(300)
+                self._gamepad.navigate_left(times=3, delay_ms=200)
+                self.page.wait_for_timeout(300)
+                # Нажимаем A для открытия
+                self._gamepad.confirm()
+                search_bar_clicked = True
                 self.page.wait_for_timeout(1500)
                 continue
             
-            elif state == VisionState.SEARCH_INPUT:
-                # Диалог ввода кода
-                if not code_entered:
-                    self._emit(f"📍 Диалог ввода → ввожу код {code}")
-                    self._enter_island_code(code)
-                    code_entered = True
-                    self.page.wait_for_timeout(2500)
-                else:
-                    # Код уже введён, но мы всё ещё на этом экране
-                    # Возможно нужно нажать Enter ещё раз
-                    self._emit("📍 Код введён, нажимаю Enter...")
-                    self.page.keyboard.press('Enter')
-                    self.page.wait_for_timeout(2000)
-                continue
-            
-            elif state == VisionState.SEARCH_RESULTS:
-                # Результаты поиска - кликаем по первой карте
-                if not card_clicked:
-                    self._emit("📍 Результаты → клик по карте острова")
-                    self._click_island_card(cx, cy, cw, ch)
-                    card_clicked = True
-                    self.page.wait_for_timeout(2000)
-                else:
-                    # Карта уже кликнута, ждём переход
-                    self.page.wait_for_timeout(1000)
-                continue
-            
-            elif state == VisionState.ISLAND_PREVIEW:
-                # Превью острова - нажимаем SELECT и PLAY
-                if not select_clicked:
-                    self._emit("📍 Превью → нажимаю SELECT")
-                    self._click_select_button(cx, cy, cw, ch)
-                    select_clicked = True
-                    self.page.wait_for_timeout(2000)
-                else:
-                    # SELECT нажат - теперь PLAY
-                    self._emit("📍 Превью → нажимаю PLAY")
-                    self._click_play_button(cx, cy, cw, ch)
-                    self.page.wait_for_timeout(2000)
-                    
-                    # Проверяем запустился ли
-                    try:
-                        img2 = capture_page_bgr(self.page)
-                        state2 = detect_screen_state(img2, use_cache=False)
-                        if state2 in [VisionState.LOADING, VisionState.IN_GAME]:
-                            self._emit("✅ Остров запущен!")
-                            self._log_input("DONE", f"Остров {code} запущен", "SMART навигация успешна")
-                            return True
-                    except:
-                        pass
-                continue
-            
-            elif state == VisionState.LOADING or state == VisionState.IN_GAME:
-                # Загрузка или в игре - успех!
-                self._emit("✅ Остров запускается!")
-                self._log_input("DONE", f"Остров {code} запущен", "SMART навигация успешна")
-                return True
-            
-            elif state == VisionState.MENU:
-                # Открыто меню - закрываем
-                self._emit("📍 Меню → закрываю (Escape)")
-                self.page.keyboard.press('Escape')
+            # ===== ШАГ 3: SEARCH_INPUT → ввод кода =====
+            elif state == VisionState.SEARCH_INPUT and not code_entered:
+                self._emit(f"📍 [3/6] Диалог ввода → ввожу код {code}")
+                # Ввод кода через клавиатуру (это единственное что через клаву)
+                self.page.keyboard.type(code, delay=50)
                 self.page.wait_for_timeout(500)
+                
+                # Навигация к кнопке ODESLAT и нажатие
+                self._gamepad.navigate_down(times=1, delay_ms=200)
+                self.page.wait_for_timeout(200)
+                self._gamepad.confirm()  # Нажимаем A на ODESLAT
+                
+                code_entered = True
+                self.page.wait_for_timeout(2500)
                 continue
             
-            elif state == VisionState.TITLE_SCREEN:
-                # Титульный экран - нажимаем для продолжения
-                self._emit("📍 Титульный экран → нажимаю для продолжения")
-                self.page.keyboard.press('Enter')
+            # ===== ШАГ 4: SEARCH_RESULTS → выбрать карточку =====
+            elif state == VisionState.SEARCH_RESULTS and not card_selected:
+                self._emit("📍 [4/6] Результаты → выбираю карточку острова")
+                # Карточка обычно уже выделена или нужно нажать вниз
+                self._gamepad.navigate_down(times=2, delay_ms=300)
+                self.page.wait_for_timeout(300)
+                self._gamepad.confirm()  # A для выбора карточки
+                card_selected = True
                 self.page.wait_for_timeout(2000)
                 continue
             
+            # ===== ШАГ 5: ISLAND_PREVIEW → лайк + SELECT =====
+            elif state == VisionState.ISLAND_PREVIEW:
+                if not like_checked:
+                    self._emit("📍 [5/6] Превью → проверяю лайк")
+                    # Проверяем и ставим лайк если нужно
+                    self._check_and_like_island(img)
+                    like_checked = True
+                    self.page.wait_for_timeout(500)
+                
+                if not select_pressed:
+                    self._emit("📍 [5/6] Превью → нажимаю SELECT")
+                    # SELECT обычно выделен по умолчанию
+                    self._gamepad.confirm()  # A для SELECT
+                    select_pressed = True
+                    self.page.wait_for_timeout(2000)
+                    continue
+            
+            # ===== ШАГ 6: Вернулись в LOBBY после SELECT → нажать PLAY =====
+            elif state == VisionState.LOBBY and select_pressed:
+                if not returned_to_lobby:
+                    self._emit("📍 [6/6] Лобби (остров выбран) → нажимаю PLAY!")
+                    # PLAY кнопка - навигация влево-вниз и A
+                    self._gamepad.navigate_left(times=2, delay_ms=200)
+                    self.page.wait_for_timeout(200)
+                    self._gamepad.navigate_down(times=1, delay_ms=200)
+                    self.page.wait_for_timeout(200)
+                    self._gamepad.confirm()  # A для PLAY
+                    returned_to_lobby = True
+                    self.page.wait_for_timeout(3000)
+                    continue
+                else:
+                    # Уже нажали PLAY, ждём загрузки
+                    self._emit("📍 PLAY нажат, жду загрузку...")
+                    self.page.wait_for_timeout(2000)
+                    continue
+            
+            # ===== УСПЕХ: Загрузка или в игре =====
+            elif state in [VisionState.LOADING, VisionState.IN_GAME]:
+                self._emit("✅ Остров запускается!")
+                self._log_input("DONE", f"Остров {code} запущен", "GAMEPAD навигация успешна")
+                return True
+            
+            # ===== TITLE_SCREEN → нажать для продолжения =====
+            elif state == VisionState.TITLE_SCREEN:
+                self._emit("📍 Титульный экран → A для продолжения")
+                self._gamepad.confirm()
+                self.page.wait_for_timeout(2000)
+                continue
+            
+            # ===== MENU → закрыть =====
+            elif state == VisionState.MENU:
+                self._emit("📍 Меню → B для закрытия")
+                self._gamepad.cancel()
+                self.page.wait_for_timeout(500)
+                continue
+            
+            # ===== UNKNOWN → ждём =====
             else:
-                # Неизвестное состояние
-                self._emit(f"❓ Неизвестное состояние: {state_name}, жду...")
+                self._emit(f"❓ Состояние: {state_name}, жду...")
                 self.page.wait_for_timeout(1500)
                 continue
         
         self._emit(f"❌ Не удалось запустить остров за {max_attempts} попыток")
         return False
     
-    def _scroll_down_to_discover(self):
-        """Скролл вниз к Discover через геймпад."""
-        if self._gamepad and self._gamepad.is_virtual:
-            self._log_input("GAMEPAD", "D-PAD DOWN", "скролл к Discover")
-            self._gamepad.navigate_down(times=1, delay_ms=150)
-        else:
-            self._log_input("KEY", "ArrowDown", "скролл к Discover")
-            self.page.keyboard.press('ArrowDown')
+    def _gamepad_scroll_down(self):
+        """Скролл вниз через геймпад D-PAD."""
+        self._log_input("GAMEPAD", "D-PAD DOWN", "скролл к Discover")
+        self._gamepad.navigate_down(times=1, delay_ms=150)
     
-    def _click_search_bar(self, cx, cy, cw, ch):
-        """Клик по Search Discover бару с поиском по шаблону."""
-        from ..vision.capture import capture_page_bgr
-        from ..vision.template_nav import find_search_discover_bar
+    def _check_and_like_island(self, img):
+        """Проверяет лайкнут ли остров и ставит лайк если нет."""
+        from ..vision.template_nav import is_island_liked, find_like_button_empty
         
-        # Пробуем найти по шаблону
-        try:
-            img = capture_page_bgr(self.page)
-            match = find_search_discover_bar(img)
-            if match:
-                click_x = cx + match.center[0]
-                click_y = cy + match.center[1]
-                self._log_input("CLICK", f"({click_x}, {click_y})", f"Search bar найден по шаблону (conf={match.confidence:.2f})")
-                self._emit(f"🎯 Search bar найден! Клик ({click_x}, {click_y})")
-                self.page.mouse.click(click_x, click_y)
-                return
-        except Exception as e:
-            self._emit(f"Ошибка поиска шаблона: {e}")
+        # Проверяем статус лайка
+        if is_island_liked(img):
+            self._emit("💜 Остров уже лайкнут")
+            return
         
-        # Fallback: Search bar находится слева вверху (~15%, 7%)
-        search_x = cx + int(cw * 0.15)
-        search_y = cy + int(ch * 0.07)
-        self._log_input("CLICK", f"({search_x}, {search_y})", "Search Discover bar (fallback)")
-        self.page.mouse.click(search_x, search_y)
+        # Остров НЕ лайкнут - ставим лайк
+        self._emit("❤️ Остров НЕ лайкнут → ставлю лайк")
+        self._log_input("GAMEPAD", "Navigate to Like + A", "ставлю лайк")
+        
+        # Навигация к лайку (обычно справа от SELECT)
+        # На Xbox лайк часто на Y или нужно навигировать вправо
+        self._gamepad.navigate_right(times=2, delay_ms=200)
+        self.page.wait_for_timeout(200)
+        self._gamepad.confirm()  # A для лайка
+        self.page.wait_for_timeout(500)
+        
+        # Вернуться к SELECT (влево)
+        self._gamepad.navigate_left(times=2, delay_ms=200)
     
-    def _enter_island_code(self, code: str):
-        """Ввод кода острова в поле."""
-        self._log_input("KEY", "Ctrl+A", "выделить всё")
-        self.page.keyboard.press('Control+a')
-        self.page.wait_for_timeout(50)
-        
-        self._log_input("TYPE", f'"{code}"', f"ввод кода, {len(code)} символов")
-        self.page.keyboard.type(code, delay=50)
-        self.page.wait_for_timeout(300)
-        
-        self._log_input("KEY", "Enter", "отправка поиска")
-        self.page.keyboard.press('Enter')
-    
-    def _click_island_card(self, cx, cy, cw, ch):
-        """Клик по карте острова в результатах с поиском по шаблону."""
-        from ..vision.capture import capture_page_bgr
-        from ..vision.template_nav import find_island_card
-        
-        # Пробуем найти по шаблону
-        try:
-            img = capture_page_bgr(self.page)
-            match = find_island_card(img)
-            if match:
-                click_x = cx + match.center[0]
-                click_y = cy + match.center[1]
-                self._log_input("CLICK", f"({click_x}, {click_y})", f"Карта найдена по шаблону (conf={match.confidence:.2f})")
-                self._emit(f"🎯 Карта острова найдена! Клик ({click_x}, {click_y})")
-                self.page.mouse.click(click_x, click_y)
-                return
-        except Exception as e:
-            self._emit(f"Ошибка поиска шаблона: {e}")
-        
-        # Fallback: Карта обычно слева по центру (~25%, 50%)
-        card_x = cx + int(cw * 0.25)
-        card_y = cy + int(ch * 0.50)
-        self._log_input("CLICK", f"({card_x}, {card_y})", "карта острова (fallback)")
-        self.page.mouse.click(card_x, card_y)
-    
-    def _click_select_button(self, cx, cy, cw, ch):
-        """Клик по кнопке SELECT с поиском по шаблону."""
-        from ..vision.capture import capture_page_bgr
-        from ..vision.template_nav import find_select_button
-        
-        # Пробуем найти по шаблону
-        try:
-            img = capture_page_bgr(self.page)
-            match = find_select_button(img)
-            if match:
-                click_x = cx + match.center[0]
-                click_y = cy + match.center[1]
-                self._log_input("CLICK", f"({click_x}, {click_y})", f"SELECT найдена по шаблону (conf={match.confidence:.2f})")
-                self._emit(f"🎯 Кнопка SELECT найдена! Клик ({click_x}, {click_y})")
-                self.page.mouse.click(click_x, click_y)
-                return
-        except Exception as e:
-            self._emit(f"Ошибка поиска шаблона: {e}")
-        
-        # Fallback: SELECT внизу по центру (~50%, 85%)
-        btn_x = cx + int(cw * 0.50)
-        btn_y = cy + int(ch * 0.85)
-        self._log_input("CLICK", f"({btn_x}, {btn_y})", "кнопка SELECT (fallback)")
-        self.page.mouse.click(btn_x, btn_y)
-    
-    def _click_play_button(self, cx, cy, cw, ch):
-        """Клик по кнопке PLAY с поиском по шаблону."""
-        from ..vision.capture import capture_page_bgr
-        from ..vision.template_nav import find_play_button
-        
-        # Пробуем найти по шаблону
-        try:
-            img = capture_page_bgr(self.page)
-            match = find_play_button(img)
-            if match:
-                click_x = cx + match.center[0]
-                click_y = cy + match.center[1]
-                self._log_input("CLICK", f"({click_x}, {click_y})", f"PLAY найдена по шаблону (conf={match.confidence:.2f})")
-                self._emit(f"🎯 Кнопка PLAY найдена! Клик ({click_x}, {click_y})")
-                self.page.mouse.click(click_x, click_y)
-                return
-        except Exception as e:
-            self._emit(f"Ошибка поиска шаблона: {e}")
-        
-        # Fallback: PLAY внизу по центру (~50%, 85%) - та же позиция что SELECT
-        btn_x = cx + int(cw * 0.50)
-        btn_y = cy + int(ch * 0.85)
-        self._log_input("CLICK", f"({btn_x}, {btn_y})", "кнопка PLAY (fallback)")
-        self.page.mouse.click(btn_x, btn_y)
+    # Старый метод для совместимости
+    def smart_launch_island(self, code: str, max_attempts: int = 30) -> bool:
+        """Алиас для smart_launch_island_gamepad."""
+        return self.smart_launch_island_gamepad(code, max_attempts)
     
     # ========================================================================
     # MOVEMENT & CAMERA
