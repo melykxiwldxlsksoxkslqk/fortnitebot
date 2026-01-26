@@ -331,39 +331,76 @@ class VirtualGamepad:
     
     def navigate_up(self, times: int = 1, delay_ms: int = 200) -> None:
         """Навигация вверх через D-pad."""
-        for _ in range(times):
+        for i in range(times):
+            logger.info(f"[Gamepad:Input] 🎮 D-PAD UP ({i+1}/{times})")
             self.press_button(XboxButton.DPAD_UP)
             time.sleep(delay_ms / 1000.0)
     
     def navigate_down(self, times: int = 1, delay_ms: int = 200) -> None:
         """Навигация вниз через D-pad."""
-        for _ in range(times):
+        for i in range(times):
+            logger.info(f"[Gamepad:Input] 🎮 D-PAD DOWN ({i+1}/{times})")
             self.press_button(XboxButton.DPAD_DOWN)
             time.sleep(delay_ms / 1000.0)
     
     def navigate_left(self, times: int = 1, delay_ms: int = 200) -> None:
         """Навигация влево через D-pad."""
-        for _ in range(times):
+        for i in range(times):
+            logger.info(f"[Gamepad:Input] 🎮 D-PAD LEFT ({i+1}/{times})")
             self.press_button(XboxButton.DPAD_LEFT)
             time.sleep(delay_ms / 1000.0)
     
     def navigate_right(self, times: int = 1, delay_ms: int = 200) -> None:
         """Навигация вправо через D-pad."""
-        for _ in range(times):
+        for i in range(times):
+            logger.info(f"[Gamepad:Input] 🎮 D-PAD RIGHT ({i+1}/{times})")
             self.press_button(XboxButton.DPAD_RIGHT)
             time.sleep(delay_ms / 1000.0)
     
     def confirm(self) -> None:
         """Подтвердить выбор (кнопка A)."""
+        logger.info("[Gamepad:Input] 🎮 Button A (Confirm)")
         self.press_button(XboxButton.A)
     
     def cancel(self) -> None:
         """Отменить/назад (кнопка B)."""
+        logger.info("[Gamepad:Input] 🎮 Button B (Cancel)")
         self.press_button(XboxButton.B)
     
     def menu(self) -> None:
         """Открыть меню (Start)."""
+        logger.info("[Gamepad:Input] 🎮 Button START (Menu)")
         self.press_button(XboxButton.START)
+    
+    def press_a(self) -> None:
+        """Нажать кнопку A."""
+        logger.info("[Gamepad:Input] 🎮 Button A")
+        self.press_button(XboxButton.A)
+    
+    def press_b(self) -> None:
+        """Нажать кнопку B."""
+        logger.info("[Gamepad:Input] 🎮 Button B")
+        self.press_button(XboxButton.B)
+    
+    def press_x(self) -> None:
+        """Нажать кнопку X."""
+        logger.info("[Gamepad:Input] 🎮 Button X")
+        self.press_button(XboxButton.X)
+    
+    def press_y(self) -> None:
+        """Нажать кнопку Y."""
+        logger.info("[Gamepad:Input] 🎮 Button Y")
+        self.press_button(XboxButton.Y)
+    
+    def release_all(self) -> None:
+        """Отпустить все кнопки."""
+        logger.info("[Gamepad:Input] 🎮 Release all buttons")
+        if self._use_virtual:
+            try:
+                self._gamepad.reset()
+                self._gamepad.update()
+            except Exception:
+                pass
     
     # ========================================================================
     # FORTNITE-SPECIFIC NAVIGATION

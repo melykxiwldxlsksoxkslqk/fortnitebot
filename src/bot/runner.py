@@ -1475,7 +1475,20 @@ class BotRunner:
             if self._should_stop():
                 return False
             
-            # Метод 1: Пробуем новый Xbox метод (скролл + search bar + диалог)
+            # Метод 1: 🧠 УМНАЯ навигация на основе Vision
+            self._log("🧠 Пробуем УМНЫЙ запуск острова (Vision-based)...")
+            success = navigator.smart_launch_island(self.island_code)
+            
+            if success:
+                self._log("✅ Остров успешно запущен через умную навигацию!")
+                return True
+            
+            self._log("Умный метод не сработал, пробуем Xbox метод...")
+            
+            if self._should_stop():
+                return False
+            
+            # Метод 2: Xbox метод (жёсткая последовательность)
             self._log("Пробуем запуск острова через Xbox метод...")
             success = navigator.search_and_launch_island_xbox(self.island_code)
             
