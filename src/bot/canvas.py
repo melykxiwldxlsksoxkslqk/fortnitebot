@@ -270,6 +270,8 @@ class CanvasNavigator:
         """
         Убедиться что канвас имеет фокус для ввода.
         
+        Делает несколько кликов по центру экрана для захвата фокуса.
+        
         Returns:
             True если фокус установлен
         """
@@ -284,18 +286,10 @@ class CanvasNavigator:
         cx, cy = x + w // 2, y + h // 2
         
         try:
-            # Несколько кликов для надёжности
-            self.page.mouse.click(cx, cy)
-            self.page.wait_for_timeout(100)
-            self.page.mouse.click(cx, cy)
-            self.page.wait_for_timeout(100)
-            
-            # Нажимаем F9 для захвата фокуса Xbox Cloud Gaming
-            try:
-                self.page.keyboard.press('F9')
-                self.page.wait_for_timeout(200)
-            except Exception:
-                pass
+            # Несколько кликов по центру для надёжного захвата фокуса
+            for _ in range(3):
+                self.page.mouse.click(cx, cy)
+                self.page.wait_for_timeout(150)
             
             self._log_action(f"focus_canvas({cx}, {cy})")
             return True
@@ -1055,10 +1049,10 @@ class CanvasNavigator:
         """
         Метод запуска острова для Xbox Cloud Gaming.
         
-        Исправленный паттерн для лобби Fortnite:
-        1. Находимся в лобби Fortnite (уже готово)
-        2. Скролл вниз геймпадом (D-pad DOWN) чтобы увидеть поле поиска
-        3. Клик по полю поиска "Search Discover" внизу экрана
+        Паттерн для лобби Fortnite:
+        1. Находимся в лобби Fortnite (видим персонажа)
+        2. Скролл вниз - появляется экран Discover с полем поиска "Search Discover"
+        3. Клик по полю поиска "Search Discover" (вверху экрана Discover)
         4. Появляется диалог с полем ввода
         5. Ввести код острова
         6. Нажать Enter/ODESLAT для поиска
@@ -1088,39 +1082,39 @@ class CanvasNavigator:
         
         cx, cy, cw, ch = bounds
         
-        # 2. Скролл вниз чтобы увидеть поле поиска "Search Discover"
-        # В лобби Fortnite поле поиска находится ниже, нужно прокрутить
-        self._emit("Скролл вниз к полю поиска...")
+        # 2. Скролл вниз чтобы перейти из лобби с персонажем в экран Discover
+        # После скролла появляется поле "Search Discover" ВВЕРХУ экрана Discover
+        self._emit("Скролл вниз к экрану Discover...")
         
         # Используем геймпад D-pad DOWN для скролла
         if self._gamepad and self._gamepad.is_virtual:
-            # Скролл через геймпад - нажимаем D-pad вниз несколько раз
+            # Скролл через геймпад - нажимаем D-pad вниз
             for _ in range(2):
-                self._gamepad.dpad_down()
-                self.page.wait_for_timeout(300)
-                self._gamepad.release_all()
+                self._gamepad.navigate_down(times=1, delay_ms=300)
                 self.page.wait_for_timeout(200)
         else:
             # Альтернативный скролл мышкой
             center_x = cx + cw // 2
             center_y = cy + ch // 2
             self.page.mouse.move(center_x, center_y)
-            self.page.mouse.wheel(0, 400)  # Скролл вниз побольше
+            self.page.mouse.wheel(0, 400)  # Скролл вниз
             self.page.wait_for_timeout(800)
         
-        self.page.wait_for_timeout(500)
+        self.page.wait_for_timeout(1000)  # Ждём анимацию перехода
         
         # 3. Клик по полю поиска "Search Discover"
-        # После скролла поле поиска должно быть примерно в центре-внизу экрана
-        self._emit("Ищу и кликаю по полю поиска...")
+        # После скролла вниз поле поиска находится ВВЕРХУ экрана Discover
+        # На скриншоте: фиолетовая полоса с лупой "Search Discover" примерно на 7% от верха
+        self._emit("Ищу и кликаю по полю поиска Search Discover (вверху)...")
         
-        # Поле поиска обычно находится в центре экрана после скролла
-        # Пробуем несколько позиций
+        # Координаты поля поиска - ВВЕРХУ экрана после скролла
+        # Поле занимает примерно x: 4%-50%, y: 7-10% от верха
         search_positions = [
-            (0.50, 0.25),  # Центр, верхняя четверть
-            (0.50, 0.20),  # Центр, выше
-            (0.50, 0.30),  # Центр, ниже
-            (0.35, 0.25),  # Левее центра
+            (0.30, 0.07),  # Центр поисковой строки, верх
+            (0.25, 0.07),  # Левее
+            (0.35, 0.08),  # Правее
+            (0.28, 0.09),  # Чуть ниже
+            (0.20, 0.07),  # Ещё левее (ближе к иконке лупы)
         ]
         
         search_clicked = False
@@ -1129,25 +1123,25 @@ class CanvasNavigator:
                 search_x = cx + int(cw * rel_x)
                 search_y = cy + int(ch * rel_y)
                 
-                self._emit(f"Пробую клик по поиску ({search_x}, {search_y})")
+                self._emit(f"Пробую клик по поиску вверху ({search_x}, {search_y})")
                 self.page.mouse.click(search_x, search_y)
                 self.page.wait_for_timeout(1500)
                 
-                # Проверяем появился ли диалог ввода (можно попробовать ввести)
+                # После клика по полю поиска должен появиться диалог ввода
                 search_clicked = True
                 break
             except Exception as e:
                 self._emit(f"Ошибка клика: {e}")
         
         if not search_clicked:
-            # Пробуем через геймпад - нажать A на текущем выделенном элементе
-            self._emit("Пробую открыть поиск через геймпад...")
-            if self._gamepad and self._gamepad.is_virtual:
-                self._gamepad.press_a()
-                self.page.wait_for_timeout(300)
-                self._gamepad.release_all()
-            else:
-                self.page.keyboard.press('Enter')
+            # Последняя попытка - клик точно по центру верхней части
+            self._emit("Финальная попытка клика по полю поиска...")
+            try:
+                search_x = cx + int(cw * 0.28)  # ~28% от левого края
+                search_y = cy + int(ch * 0.075)  # ~7.5% от верха
+                self.page.mouse.click(search_x, search_y)
+            except Exception:
+                pass
             self.page.wait_for_timeout(1500)
         
         # 4. Ждём появление диалога с полем ввода

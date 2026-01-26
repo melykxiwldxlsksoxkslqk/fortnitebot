@@ -1399,11 +1399,16 @@ class BotRunner:
                         if stable_lobby_count >= 2:  # 2 проверки подряд
                             self._log("Лобби Fortnite загружено и стабильно!")
                             
-                            # Нажимаем F9 для захвата фокуса
-                            self._log("Нажимаем F9 для захвата фокуса...")
+                            # Кликаем по центру экрана для захвата фокуса
+                            self._log("Клик по центру экрана для захвата фокуса...")
                             try:
-                                self.page.keyboard.press('F9')
-                                time.sleep(0.5)
+                                viewport = self.page.viewport_size
+                                if viewport:
+                                    cx = viewport['width'] // 2
+                                    cy = viewport['height'] // 2
+                                    for _ in range(3):
+                                        self.page.mouse.click(cx, cy)
+                                        time.sleep(0.15)
                             except Exception:
                                 pass
                             
