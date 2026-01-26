@@ -1055,15 +1055,16 @@ class CanvasNavigator:
         """
         Метод запуска острова для Xbox Cloud Gaming.
         
-        Новый паттерн:
-        1. Скролл вниз в лобби
-        2. Клик по search bar "Search Discover"
-        3. Появляется Xbox диалог с полем ввода
-        4. Ввести код острова
-        5. Нажать кнопку "ODESLAT" (отправить)
-        6. Кликнуть на первую карту в результатах
-        7. Нажать желтую кнопку "SELECT"
-        8. Нажать кнопку "PLAY"
+        Исправленный паттерн для лобби Fortnite:
+        1. Находимся в лобби Fortnite (уже готово)
+        2. Скролл вниз геймпадом (D-pad DOWN) чтобы увидеть поле поиска
+        3. Клик по полю поиска "Search Discover" внизу экрана
+        4. Появляется диалог с полем ввода
+        5. Ввести код острова
+        6. Нажать Enter/ODESLAT для поиска
+        7. Выбрать первую карту в результатах
+        8. Нажать SELECT
+        9. Нажать PLAY
         
         Args:
             code: Код острова
@@ -1080,102 +1081,141 @@ class CanvasNavigator:
         
         self.page.wait_for_timeout(500)
         
-        # 2. Скролл вниз чтобы увидеть search bar
-        self._emit("Скролл вниз к поиску...")
         bounds = self.get_canvas_bounds()
-        if bounds:
-            cx, cy, cw, ch = bounds
-            # Скролл в центре экрана вниз
+        if not bounds:
+            self._emit("Не удалось получить размеры канваса")
+            return False
+        
+        cx, cy, cw, ch = bounds
+        
+        # 2. Скролл вниз чтобы увидеть поле поиска "Search Discover"
+        # В лобби Fortnite поле поиска находится ниже, нужно прокрутить
+        self._emit("Скролл вниз к полю поиска...")
+        
+        # Используем геймпад D-pad DOWN для скролла
+        if self._gamepad and self._gamepad.is_virtual:
+            # Скролл через геймпад - нажимаем D-pad вниз несколько раз
+            for _ in range(2):
+                self._gamepad.dpad_down()
+                self.page.wait_for_timeout(300)
+                self._gamepad.release_all()
+                self.page.wait_for_timeout(200)
+        else:
+            # Альтернативный скролл мышкой
             center_x = cx + cw // 2
             center_y = cy + ch // 2
             self.page.mouse.move(center_x, center_y)
-            self.page.mouse.wheel(0, 300)  # Скролл вниз
+            self.page.mouse.wheel(0, 400)  # Скролл вниз побольше
             self.page.wait_for_timeout(800)
         
-        # 3. Клик по search bar "Search Discover"
-        self._emit("Ищу и кликаю по Search Discover...")
-        search_clicked = False
+        self.page.wait_for_timeout(500)
         
-        # Пробуем найти search bar через DOM (iframe Xbox)
-        try:
-            # Search bar обычно в верхней левой части с иконкой лупы
-            # Координаты примерно 5-15% сверху, 5-40% слева
-            if bounds:
-                # Пробуем кликнуть по области поиска (верхняя левая часть)
-                search_x = cx + int(cw * 0.20)  # 20% слева
-                search_y = cy + int(ch * 0.12)  # 12% сверху
+        # 3. Клик по полю поиска "Search Discover"
+        # После скролла поле поиска должно быть примерно в центре-внизу экрана
+        self._emit("Ищу и кликаю по полю поиска...")
+        
+        # Поле поиска обычно находится в центре экрана после скролла
+        # Пробуем несколько позиций
+        search_positions = [
+            (0.50, 0.25),  # Центр, верхняя четверть
+            (0.50, 0.20),  # Центр, выше
+            (0.50, 0.30),  # Центр, ниже
+            (0.35, 0.25),  # Левее центра
+        ]
+        
+        search_clicked = False
+        for rel_x, rel_y in search_positions:
+            try:
+                search_x = cx + int(cw * rel_x)
+                search_y = cy + int(ch * rel_y)
                 
-                self._emit(f"Кликаю по search bar ({search_x}, {search_y})")
+                self._emit(f"Пробую клик по поиску ({search_x}, {search_y})")
                 self.page.mouse.click(search_x, search_y)
-                self.page.wait_for_timeout(1000)
+                self.page.wait_for_timeout(1500)
+                
+                # Проверяем появился ли диалог ввода (можно попробовать ввести)
                 search_clicked = True
-        except Exception as e:
-            self._emit(f"Ошибка клика по search: {e}")
+                break
+            except Exception as e:
+                self._emit(f"Ошибка клика: {e}")
         
         if not search_clicked:
-            self._emit("Не удалось кликнуть по search bar")
-            return False
+            # Пробуем через геймпад - нажать A на текущем выделенном элементе
+            self._emit("Пробую открыть поиск через геймпад...")
+            if self._gamepad and self._gamepad.is_virtual:
+                self._gamepad.press_a()
+                self.page.wait_for_timeout(300)
+                self._gamepad.release_all()
+            else:
+                self.page.keyboard.press('Enter')
+            self.page.wait_for_timeout(1500)
         
-        # 4. Ждём появления Xbox диалога с полем ввода
-        self._emit("Ожидаю появление диалога ввода...")
-        self.page.wait_for_timeout(1500)
+        # 4. Ждём появление диалога с полем ввода
+        self._emit("Ожидаю диалог ввода кода...")
+        self.page.wait_for_timeout(1000)
         
         # 5. Ввести код острова
-        # Пробуем несколько способов ввода
         self._emit(f"Ввожу код острова: {code}")
         
-        # Способ 1: Просто печатаем (если фокус уже в поле)
         try:
+            # Очищаем поле на всякий случай
+            self.page.keyboard.press('Control+a')
+            self.page.wait_for_timeout(50)
             self.page.keyboard.type(code, delay=50)
             self.page.wait_for_timeout(500)
         except Exception as e:
             self._emit(f"Ошибка ввода: {e}")
         
-        # 6. Нажать кнопку "ODESLAT" (отправить)
-        self._emit("Нажимаю ODESLAT (отправить)...")
+        # 6. Нажать Enter/ODESLAT для поиска
+        self._emit("Отправляю поиск...")
         
         # Пробуем найти кнопку через DOM
         odeslat_clicked = False
         try:
-            # Кнопка ODESLAT обычно зелёная/синяя под полем ввода
-            btn = self.page.locator('button:has-text("ODESLAT"), button:has-text("Odeslat"), button:has-text("Send"), button:has-text("Submit")').first
+            btn = self.page.locator('button:has-text("ODESLAT"), button:has-text("Odeslat"), button:has-text("Send"), button:has-text("Submit"), button:has-text("Search")').first
             if btn and btn.is_visible(timeout=2000):
                 btn.click()
                 odeslat_clicked = True
-                self._emit("Кнопка ODESLAT найдена и нажата")
+                self._emit("Кнопка отправки найдена и нажата")
         except Exception:
             pass
         
         if not odeslat_clicked:
-            # Fallback: Enter
-            self._emit("Кнопка ODESLAT не найдена, нажимаю Enter")
+            self._emit("Нажимаю Enter для поиска")
             self.page.keyboard.press('Enter')
         
-        self.page.wait_for_timeout(2000)
+        self.page.wait_for_timeout(2500)
         
-        # 7. Кликнуть на первую карту в результатах
+        # 7. Выбрать первую карту в результатах
         self._emit("Выбираю первую карту в результатах...")
-        try:
-            if bounds:
-                # Первая карта обычно в левой части под search bar
-                # Примерно 10-30% слева, 30-50% сверху
-                card_x = cx + int(cw * 0.15)  # 15% слева
-                card_y = cy + int(ch * 0.45)  # 45% сверху
+        
+        # Карта обычно появляется слева-по центру
+        card_positions = [
+            (0.25, 0.50),  # Левая часть, центр
+            (0.30, 0.45),  # Чуть правее и выше
+            (0.20, 0.55),  # Левее и ниже
+        ]
+        
+        for rel_x, rel_y in card_positions:
+            try:
+                card_x = cx + int(cw * rel_x)
+                card_y = cy + int(ch * rel_y)
                 
-                self._emit(f"Кликаю по первой карте ({card_x}, {card_y})")
+                self._emit(f"Кликаю по карте ({card_x}, {card_y})")
                 self.page.mouse.click(card_x, card_y)
                 self.page.wait_for_timeout(1500)
-        except Exception as e:
-            self._emit(f"Ошибка клика по карте: {e}")
+                break
+            except Exception as e:
+                self._emit(f"Ошибка клика по карте: {e}")
         
-        # 8. Нажать желтую кнопку "SELECT"
+        # 8. Нажать SELECT
         self._emit("Ищу и нажимаю кнопку SELECT...")
-        select_clicked = False
         
+        # Пробуем найти кнопку через DOM
+        select_clicked = False
         try:
-            # Кнопка SELECT обычно желтая в нижней левой части
-            btn = self.page.locator('button:has-text("SELECT"), button:has-text("Select"), button:has-text("VYBRAT")').first
-            if btn and btn.is_visible(timeout=3000):
+            btn = self.page.locator('button:has-text("SELECT"), button:has-text("Select"), button:has-text("VYBRAT"), button:has-text("Vybrat")').first
+            if btn and btn.is_visible(timeout=2000):
                 btn.click()
                 select_clicked = True
                 self._emit("Кнопка SELECT найдена и нажата")
@@ -1183,23 +1223,21 @@ class CanvasNavigator:
             pass
         
         if not select_clicked:
-            # Fallback: координаты
-            if bounds:
-                # SELECT обычно внизу слева
-                select_x = cx + int(cw * 0.20)
-                select_y = cy + int(ch * 0.80)
-                self._emit(f"Кликаю по координатам SELECT ({select_x}, {select_y})")
-                self.page.mouse.click(select_x, select_y)
+            # Fallback: координаты внизу экрана
+            select_x = cx + int(cw * 0.50)  # Центр
+            select_y = cy + int(ch * 0.85)  # Низ экрана
+            self._emit(f"Кликаю по координатам SELECT ({select_x}, {select_y})")
+            self.page.mouse.click(select_x, select_y)
         
         self.page.wait_for_timeout(2000)
         
-        # 9. Нажать кнопку "PLAY"
+        # 9. Нажать PLAY
         self._emit("Ищу и нажимаю кнопку PLAY...")
-        play_clicked = False
         
+        play_clicked = False
         try:
-            btn = self.page.locator('button:has-text("PLAY"), button:has-text("Play"), button:has-text("HRÁT")').first
-            if btn and btn.is_visible(timeout=3000):
+            btn = self.page.locator('button:has-text("PLAY"), button:has-text("Play"), button:has-text("HRÁT"), button:has-text("Hrát")').first
+            if btn and btn.is_visible(timeout=2000):
                 btn.click()
                 play_clicked = True
                 self._emit("Кнопка PLAY найдена и нажата")
@@ -1207,15 +1245,13 @@ class CanvasNavigator:
             pass
         
         if not play_clicked:
-            # Fallback: координаты
-            if bounds:
-                # PLAY обычно внизу слева (та же область что SELECT)
-                play_x = cx + int(cw * 0.20)
-                play_y = cy + int(ch * 0.80)
-                self._emit(f"Кликаю по координатам PLAY ({play_x}, {play_y})")
-                self.page.mouse.click(play_x, play_y)
+            # Fallback: та же позиция что SELECT (кнопки меняются)
+            play_x = cx + int(cw * 0.50)
+            play_y = cy + int(ch * 0.85)
+            self._emit(f"Кликаю по координатам PLAY ({play_x}, {play_y})")
+            self.page.mouse.click(play_x, play_y)
         
-        self.page.wait_for_timeout(1000)
+        self.page.wait_for_timeout(1500)
         
         self._emit("Остров запущен через Xbox метод!")
         return True

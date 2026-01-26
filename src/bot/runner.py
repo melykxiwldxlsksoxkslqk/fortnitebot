@@ -1174,11 +1174,9 @@ class BotRunner:
         play_retry_count = 0  # Счётчик повторных попыток нажать Play
         last_log_time = 0
         lobby_detected_count = 0  # Счётчик последовательных обнаружений лобби
-        search_icon_check_interval = 2  # Проверять иконку поиска каждые 2 секунды
-        last_search_icon_check = 0
         
         self._log("Нажмите кнопку 'Лобби готово' в UI когда персонаж появится в лобби")
-        self._log("(Также бот автоматически обнаружит лобби по иконке поиска)")
+        self._log("(Также бот автоматически обнаружит лобби по состоянию экрана)")
         
         while time.time() - start < timeout:
             # Проверяем остановку
@@ -1300,30 +1298,19 @@ class BotRunner:
                     time.sleep(3)
                     continue
                 
-                # АВТОДЕТЕКЦИЯ ЛОББИ: если состояние LOBBY, проверяем иконку поиска
+                # АВТОДЕТЕКЦИЯ ЛОББИ: если состояние LOBBY стабильно 3 раза подряд
                 if state == vision.ScreenState.LOBBY:
-                    # Проверяем иконку поиска каждые N секунд для надёжности
-                    if current_time - last_search_icon_check >= search_icon_check_interval:
-                        last_search_icon_check = current_time
-                        try:
-                            search_icon_result = vision.find_search_icon(self.page)
-                            if search_icon_result:
-                                lobby_detected_count += 1
-                                self._log(f"Иконка поиска обнаружена! Проверка {lobby_detected_count}/3")
-                                
-                                # Требуем 3 последовательных обнаружения для надёжности
-                                if lobby_detected_count >= 3:
-                                    self._log("ЛОББИ ПОДТВЕРЖДЕНО автоматически! (иконка поиска найдена 3 раза)")
-                                    return True
-                            else:
-                                # Сбрасываем счётчик если иконка не найдена
-                                if lobby_detected_count > 0:
-                                    self._log("Иконка поиска не найдена, сброс счётчика")
-                                lobby_detected_count = 0
-                        except Exception as e:
-                            self._log(f"Ошибка поиска иконки: {e}")
+                    lobby_detected_count += 1
+                    self._log(f"Состояние LOBBY обнаружено! Проверка {lobby_detected_count}/3")
+                    
+                    # Требуем 3 последовательных обнаружения для надёжности
+                    if lobby_detected_count >= 3:
+                        self._log("ЛОББИ ПОДТВЕРЖДЕНО автоматически! (состояние LOBBY стабильно 3 раза)")
+                        return True
                 else:
                     # Если состояние не LOBBY - сбрасываем счётчик
+                    if lobby_detected_count > 0:
+                        self._log(f"Состояние изменилось на {state.name}, сброс счётчика")
                     lobby_detected_count = 0
                 
                 # Очередь Xbox - просто ждём и информируем пользователя
