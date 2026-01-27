@@ -42,6 +42,8 @@ class ScreenState(Enum):
     LOADING = auto()
     MAIN_MENU = auto()
     LOBBY = auto()
+    DISCOVER = auto()           # Экран Discover с поиском островов
+    SEARCH_INPUT = auto()       # Диалог ввода кода острова
     SEARCH_PANEL = auto()
     ISLAND_PREVIEW = auto()
     MATCHMAKING = auto()
@@ -373,6 +375,10 @@ class CanvasNavigator:
             ('assets/play_button_yellow.png', 'play_button', ScreenState.LOBBY, None),
             ('assets/play_button.png', 'play_button_alt', ScreenState.LOBBY, None),
             ('assets/search_icon.png', 'search_icon', ScreenState.LOBBY, (0, 0, 0.4, 0.3)),  # Увеличен ROI для лупы
+            ('assets/search_discover_bar.png', 'search_bar', ScreenState.DISCOVER, (0, 0, 0.5, 0.2)),  # Search Discover бар
+            ('assets/search_dialog.png', 'search_dialog', ScreenState.SEARCH_INPUT, (0.15, 0.15, 0.85, 0.7)),  # Диалог поиска
+            ('assets/odeslat_button.png', 'odeslat_button', ScreenState.SEARCH_INPUT, (0.25, 0.3, 0.75, 0.65)),  # Кнопка ODESLAT
+            ('assets/search_input_field.png', 'search_input_field', ScreenState.SEARCH_INPUT, (0.2, 0.2, 0.8, 0.55)),  # Поле ввода
             ('assets/island_code_input_field.png', 'search_input', ScreenState.SEARCH_PANEL, (0, 0, 1, 0.5)),
             ('assets/select_button.png', 'select_button', ScreenState.ISLAND_PREVIEW, None),
             ('assets/loading_spinner.png', 'loading', ScreenState.LOADING, None),
@@ -1389,13 +1395,18 @@ class CanvasNavigator:
             
             # ===== ШАГ 2: DISCOVER → открыть Search диалог =====
             elif state == VisionState.DISCOVER and not search_bar_clicked:
-                self._emit("📍 [2/6] Discover → навигация к Search bar + A")
-                # Search bar слева - навигация влево и вверх
-                self._gamepad.navigate_up(times=2, delay_ms=200)
-                self.page.wait_for_timeout(300)
-                self._gamepad.navigate_left(times=3, delay_ms=200)
-                self.page.wait_for_timeout(300)
-                # Нажимаем A для открытия
+                self._emit("📍 [2/6] Discover → открываю Search диалог")
+                # На DISCOVER экране Search bar уже видим слева вверху
+                # Нужно просто нажать D-PAD DOWN чтобы фокус попал на Search bar
+                # Потом нажать A (или LT) для открытия диалога ввода
+                
+                # Один D-PAD DOWN чтобы выбрать Search bar
+                self._emit("  → D-PAD DOWN (выбор Search bar)")
+                self._gamepad.navigate_down(times=1, delay_ms=200)
+                self.page.wait_for_timeout(500)
+                
+                # Нажимаем A для открытия диалога ввода
+                self._emit("  → A (открыть диалог ввода)")
                 self._gamepad.confirm()
                 search_bar_clicked = True
                 self.page.wait_for_timeout(1500)

@@ -34,8 +34,203 @@ def set_vision_debug(enabled: bool):
         os.makedirs(_DEBUG_DIR, exist_ok=True)
 
 
-def _save_debug_image(img: np.ndarray, state: str, info: dict = None):
-    """Сохраняет debug скриншот с информацией о детекции."""
+# ============================================================================
+# TEMPLATE MATCHING СИСТЕМА
+# ============================================================================
+
+# Кэш загруженных шаблонов
+_TEMPLATE_CACHE: Dict[str, np.ndarray] = {}
+
+# Конфигурация UI элементов определяется после класса ScreenState (см. ниже)
+UI_ELEMENTS_CONFIG = []  # Будет заполнено после определения ScreenState
+
+
+def _load_template(name: str) -> Optional[np.ndarray]:
+    """Загружает шаблон из кэша или с диска."""
+    if name in _TEMPLATE_CACHE:
+        return _TEMPLATE_CACHE[name]
+    
+    template_path = os.path.join(ROOT_DIR, 'assets', name)
+    if not os.path.exists(template_path):
+        return None
+    
+    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+    if template is not None:
+        _TEMPLATE_CACHE[name] = template
+    
+    return template
+
+
+def _find_template_multi_scale(
+    img_gray: np.ndarray, 
+    template: np.ndarray, 
+    roi: Tuple[float, float, float, float] = None,
+    threshold: float = 0.8,
+    scales: List[float] = None
+) -> Optional[Tuple[int, int, int, int, float]]:
+    """
+    Ищет шаблон с multi-scale matching.
+    
+    ВАЖНО: Используем ограниченный диапазон масштабов для скорости и точности.
+    
+    Returns:
+        (x, y, w, h, confidence) или None
+    """
+    if scales is None:
+        # Ограниченный диапазон для более точного matching
+        # UI элементы обычно не сильно меняют размер
+        scales = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+    
+    h, w = img_gray.shape[:2]
+    
+    # Применяем ROI если указан
+    if roi:
+        x0, y0 = int(w * roi[0]), int(h * roi[1])
+        x1, y1 = int(w * roi[2]), int(h * roi[3])
+        # Проверяем валидность ROI
+        if x1 <= x0 or y1 <= y0:
+            return None
+        search_img = img_gray[y0:y1, x0:x1]
+        offset_x, offset_y = x0, y0
+    else:
+        search_img = img_gray
+        offset_x, offset_y = 0, 0
+    
+    # Минимальный размер области поиска
+    if search_img.shape[0] < 20 or search_img.shape[1] < 20:
+        return None
+    
+    best_val = 0
+    best_result = None
+    
+    for scale in scales:
+        resized = cv2.resize(template, None, fx=scale, fy=scale)
+        th, tw = resized.shape[:2]
+        
+        if th > search_img.shape[0] or tw > search_img.shape[1]:
+            continue
+        
+        # Минимальный размер шаблона
+        if th < 10 or tw < 10:
+            continue
+        
+        result = cv2.matchTemplate(search_img, resized, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        
+        if max_val > best_val:
+            best_val = max_val
+            best_result = (
+                max_loc[0] + offset_x,
+                max_loc[1] + offset_y,
+                tw, th,
+                max_val
+            )
+    
+    if best_val >= threshold:
+        return best_result
+    return None
+
+
+def _detect_ui_elements(img: np.ndarray) -> List[Dict]:
+    """
+    Ищет все UI элементы на изображении через template matching.
+    
+    Включает валидацию контекста для избежания false positives.
+    
+    Returns:
+        Список найденных элементов с координатами и confidence
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    
+    # ================================================================
+    # КОНТЕКСТНАЯ ВАЛИДАЦИЯ - исключаем false positives
+    # ================================================================
+    mean_brightness = np.mean(gray)
+    
+    # Если экран очень тёмный (загрузка) - не ищем UI элементы
+    # Исключение: специфичные элементы для loading экранов
+    is_dark_screen = mean_brightness < 35
+    
+    # Проверяем есть ли характерные признаки Discover/Lobby экрана
+    # (яркая верхняя панель меню)
+    top_bar = gray[0:int(h*0.12), :]
+    top_bar_brightness = np.mean(top_bar)
+    has_menu_bar = top_bar_brightness > 80  # Меню обычно светлое
+    
+    found_elements = []
+    
+    for template_name, state, roi, threshold, priority in UI_ELEMENTS_CONFIG:
+        template = _load_template(template_name)
+        if template is None:
+            continue
+        
+        # ============================================================
+        # КОНТЕКСТНЫЕ ФИЛЬТРЫ
+        # ============================================================
+        
+        # На тёмном экране загрузки НЕ ищем UI элементы
+        if is_dark_screen:
+            # Разрешаем только специфичные loading элементы если они будут
+            _log_debug(f"Пропуск {template_name}: тёмный экран загрузки")
+            continue
+        
+        # search_input_field требует наличия меню бара (не на загрузке)
+        if 'search_input' in template_name.lower() and not has_menu_bar:
+            _log_debug(f"Пропуск {template_name}: нет меню бара")
+            continue
+        
+        # select_button должен быть ТОЛЬКО внизу экрана
+        if 'select_button' in template_name.lower():
+            # Проверяем что область снизу достаточно яркая (не игровой контент)
+            bottom_area = gray[int(h*0.85):, :]
+            if np.mean(bottom_area) < 50:
+                _log_debug(f"Пропуск {template_name}: тёмная нижняя область")
+                continue
+        
+        result = _find_template_multi_scale(gray, template, roi, threshold)
+        
+        if result:
+            x, y, elem_w, elem_h, confidence = result
+            
+            # ============================================================
+            # POST-DETECTION ВАЛИДАЦИЯ
+            # ============================================================
+            
+            # Проверяем что элемент не на карточке игры (для search_input_field)
+            if 'search_input' in template_name.lower():
+                # search_input_field должен быть в верхней половине экрана
+                if y > h * 0.55:
+                    _log_debug(f"Отклонён {template_name}: слишком низко на экране")
+                    continue
+                # И должен быть достаточно широким (не карточка)
+                if elem_w < w * 0.15:
+                    _log_debug(f"Отклонён {template_name}: слишком узкий")
+                    continue
+            
+            # select_button должен быть в нижней части
+            if 'select_button' in template_name.lower():
+                if y < h * 0.70:
+                    _log_debug(f"Отклонён {template_name}: слишком высоко")
+                    continue
+            
+            found_elements.append({
+                'name': template_name.replace('.png', ''),
+                'state': state,
+                'x': x, 'y': y, 'w': elem_w, 'h': elem_h,
+                'confidence': confidence,
+                'priority': priority
+            })
+            _log_debug(f"Найден элемент: {template_name} at ({x},{y}) conf={confidence:.3f}")
+    
+    # Сортируем по приоритету (высший первый)
+    found_elements.sort(key=lambda e: (-e['priority'], -e['confidence']))
+    
+    return found_elements
+
+
+def _save_debug_image(img: np.ndarray, state: str, info: dict = None, elements: List[Dict] = None):
+    """Сохраняет debug скриншот с информацией о детекции и найденными элементами."""
     if not _VISION_DEBUG:
         return
     
@@ -44,61 +239,112 @@ def _save_debug_image(img: np.ndarray, state: str, info: dict = None):
         debug_img = img.copy()
         h, w = debug_img.shape[:2]
         
+        # ============================================================
+        # РИСУЕМ НАЙДЕННЫЕ UI ЭЛЕМЕНТЫ
+        # ============================================================
+        if elements:
+            for elem in elements:
+                x, y, ew, eh = elem['x'], elem['y'], elem['w'], elem['h']
+                conf = elem['confidence']
+                name = elem['name']
+                
+                # Цвет рамки в зависимости от confidence
+                if conf > 0.8:
+                    color = (0, 255, 0)  # Зелёный - отлично
+                elif conf > 0.65:
+                    color = (0, 255, 255)  # Жёлтый - хорошо
+                else:
+                    color = (0, 165, 255)  # Оранжевый - средне
+                
+                # Рамка элемента
+                cv2.rectangle(debug_img, (x, y), (x + ew, y + eh), color, 2)
+                
+                # Подпись с названием и confidence
+                label = f"{name} ({conf:.0%})"
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                
+                # Фон для подписи
+                cv2.rectangle(debug_img, (x, y - 20), (x + label_size[0] + 4, y), color, -1)
+                cv2.putText(debug_img, label, (x + 2, y - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        # ============================================================
+        # ИНФОРМАЦИОННАЯ ПАНЕЛЬ
+        # ============================================================
         # Добавляем полупрозрачный фон для текста
         overlay = debug_img.copy()
-        cv2.rectangle(overlay, (0, 0), (400, 200), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, debug_img, 0.4, 0, debug_img)
+        panel_height = 180 + (len(elements) * 22 if elements else 0)
+        panel_height = min(panel_height, h - 20)
+        cv2.rectangle(overlay, (0, 0), (450, panel_height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, debug_img, 0.3, 0, debug_img)
         
-        # Добавляем информацию на изображение
         font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.7
-        thickness = 2
         
         # Состояние (большим шрифтом)
-        state_color = (0, 255, 0) if state == "LOBBY" else (0, 255, 255) if state in ["LOADING", "XBOX_QUEUE"] else (255, 255, 255)
+        state_colors = {
+            "LOBBY": (0, 255, 0),
+            "DISCOVER": (255, 255, 0),
+            "SEARCH_INPUT": (0, 255, 255),
+            "SEARCH_RESULTS": (255, 200, 0),
+            "ISLAND_PREVIEW": (255, 150, 0),
+            "LOADING": (150, 150, 150),
+            "XBOX_LOADING": (150, 150, 150),
+            "XBOX_QUEUE": (150, 150, 150),
+        }
+        state_color = state_colors.get(state, (255, 255, 255))
         cv2.putText(debug_img, f"State: {state}", (10, 30), font, 0.9, state_color, 2)
         
         # Время
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        cv2.putText(debug_img, f"Time: {timestamp}", (10, 60), font, font_scale, (200, 200, 200), thickness)
+        cv2.putText(debug_img, f"Time: {timestamp}", (10, 55), font, 0.6, (200, 200, 200), 1)
         
         # Размер изображения
-        cv2.putText(debug_img, f"Size: {w}x{h}", (10, 90), font, 0.5, (150, 150, 150), 1)
+        cv2.putText(debug_img, f"Size: {w}x{h}", (10, 75), font, 0.5, (150, 150, 150), 1)
         
-        # Дополнительная информация
+        # ============================================================
+        # СПИСОК НАЙДЕННЫХ ЭЛЕМЕНТОВ
+        # ============================================================
+        y_offset = 100
+        if elements:
+            cv2.putText(debug_img, f"Found {len(elements)} UI elements:", (10, y_offset), 
+                       font, 0.55, (100, 255, 100), 1)
+            y_offset += 22
+            
+            for elem in elements[:8]:  # Показываем максимум 8
+                conf = elem['confidence']
+                color = (0, 255, 0) if conf > 0.7 else (0, 255, 255) if conf > 0.6 else (0, 165, 255)
+                text = f"  • {elem['name']}: {conf:.0%} at ({elem['x']},{elem['y']})"
+                cv2.putText(debug_img, text, (10, y_offset), font, 0.45, color, 1)
+                y_offset += 20
+        else:
+            cv2.putText(debug_img, "No UI elements found", (10, y_offset), 
+                       font, 0.55, (100, 100, 255), 1)
+            y_offset += 22
+        
+        # Дополнительная информация (метрики)
         if info:
-            y_offset = 120
-            for key, value in info.items():
-                # Цвет в зависимости от ключа
+            y_offset += 5
+            for key, value in list(info.items())[:5]:
                 if "check" in key.lower():
                     color = (0, 255, 0) if value == "True" else (100, 100, 255)
-                elif "brightness" in key.lower():
-                    color = (255, 255, 0)
-                elif "contrast" in key.lower():
-                    color = (255, 200, 0)
                 else:
-                    color = (200, 200, 200)
-                    
-                text = f"{key}: {value}"
-                cv2.putText(debug_img, text, (10, y_offset), font, 0.5, color, 1)
-                y_offset += 22
-                if y_offset > 200:
-                    break
+                    color = (180, 180, 180)
+                cv2.putText(debug_img, f"{key}: {value}", (10, y_offset), font, 0.45, color, 1)
+                y_offset += 18
         
-        # Рисуем области интереса (ROI) на изображении
+        # ============================================================
+        # ROI ОБЛАСТИ (для debug)
+        # ============================================================
         # Верхняя панель (меню)
-        cv2.rectangle(debug_img, (0, 0), (w, int(h*0.12)), (0, 100, 255), 1)
-        cv2.putText(debug_img, "TOP UI", (5, int(h*0.12) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 100, 255), 1)
-        
+        cv2.rectangle(debug_img, (0, 0), (w, int(h*0.12)), (50, 50, 150), 1)
         # Нижняя панель
-        cv2.rectangle(debug_img, (0, int(h*0.85)), (w, h), (0, 100, 255), 1)
-        cv2.putText(debug_img, "BOTTOM UI", (5, int(h*0.85) + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 100, 255), 1)
+        cv2.rectangle(debug_img, (0, int(h*0.85)), (w, h), (50, 50, 150), 1)
         
-        # Сохраняем с уникальным именем (включая миллисекунды)
-        timestamp = datetime.now().strftime('%H%M%S_%f')[:13]  # HHMMSS_mmm
+        # Сохраняем с уникальным именем
+        timestamp = datetime.now().strftime('%H%M%S_%f')[:13]
         filename = f"{timestamp}_{state}.jpg"
         filepath = os.path.join(_DEBUG_DIR, filename)
-        cv2.imwrite(filepath, debug_img)
+        cv2.imwrite(filepath, debug_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
         
     except Exception as e:
         _vision_logger.debug(f"Ошибка сохранения debug изображения: {e}")
@@ -156,6 +402,62 @@ class ScreenState(Enum):
     IN_GAME = auto()           # В игре
     MENU = auto()              # Меню/настройки
     ERROR = auto()             # Ошибка/диалог
+    POPUP = auto()             # Popup уведомление (новости, ивенты - нужно закрыть)
+
+
+# ============================================================================
+# КОНФИГУРАЦИЯ UI ЭЛЕМЕНТОВ ДЛЯ TEMPLATE MATCHING
+# ============================================================================
+# (template_name, associated_state, roi, threshold, priority)
+# roi = (x0, y0, x1, y1) в процентах от размера экрана
+# priority - чем выше, тем раньше проверяется
+# 
+# ВАЖНО: threshold должен быть ВЫСОКИМ (0.82+) чтобы избежать false positives!
+# ROI должен быть УЗКИМ и точно соответствовать месту элемента на экране!
+UI_ELEMENTS_CONFIG.clear()
+UI_ELEMENTS_CONFIG.extend([
+    # =========================================================================
+    # SEARCH INPUT DIALOG - диалог ввода кода острова (появляется по центру)
+    # Это popup окно, которое появляется поверх Discover экрана
+    # =========================================================================
+    # Кнопка "Odeslat" (отправить) - внутри диалога, правая часть
+    ('odeslat_button.png', ScreenState.SEARCH_INPUT, (0.40, 0.35, 0.70, 0.55), 0.85, 10),
+    # Весь диалог поиска - по центру экрана
+    ('search_dialog.png', ScreenState.SEARCH_INPUT, (0.25, 0.25, 0.75, 0.60), 0.83, 10),
+    # Поле ввода внутри диалога - узкая полоса по центру
+    ('search_input_field.png', ScreenState.SEARCH_INPUT, (0.30, 0.35, 0.70, 0.50), 0.85, 9),
+    
+    # =========================================================================
+    # DISCOVER SCREEN - главный экран с поиском
+    # "Search Discover" бар находится в ЛЕВОМ ВЕРХНЕМ углу
+    # =========================================================================
+    ('search_discover_bar.png', ScreenState.DISCOVER, (0.02, 0.06, 0.35, 0.16), 0.83, 8),
+    
+    # =========================================================================
+    # LOBBY - главное меню с кнопкой PLAY
+    # Кнопка PLAY жёлтая, находится в ЛЕВОМ ВЕРХНЕМ углу
+    # =========================================================================
+    ('play_button_yellow.png', ScreenState.LOBBY, (0.02, 0.03, 0.18, 0.12), 0.85, 7),
+    
+    # =========================================================================
+    # ISLAND PREVIEW - предпросмотр острова перед запуском
+    # Кнопки SELECT/PLAY находятся ВНИЗУ по центру
+    # =========================================================================
+    # Кнопка Select - нижняя часть экрана, по центру
+    ('select_button.png', ScreenState.ISLAND_PREVIEW, (0.35, 0.80, 0.65, 0.98), 0.85, 5),
+    # Кнопка Play Island - нижняя часть экрана, по центру  
+    ('play_button_island.png', ScreenState.ISLAND_PREVIEW, (0.35, 0.80, 0.65, 0.98), 0.85, 5),
+    
+    # Like button - на карточке острова, ВЕРХНЯЯ ЛЕВАЯ область карточки
+    ('like_button_empty.png', ScreenState.ISLAND_PREVIEW, (0.02, 0.15, 0.25, 0.45), 0.87, 4),
+    ('like_button_filled.png', ScreenState.ISLAND_PREVIEW, (0.02, 0.15, 0.25, 0.45), 0.87, 4),
+    
+    # =========================================================================
+    # SEARCH RESULTS - результаты поиска острова
+    # Карточки островов появляются в центре экрана
+    # =========================================================================
+    ('island_card.png', ScreenState.SEARCH_RESULTS, (0.15, 0.20, 0.55, 0.75), 0.83, 3),
+])
 
 
 # Кэш состояния
@@ -178,14 +480,46 @@ def _detect_xbox_logo_screen(img: np.ndarray) -> bool:
     - Тёмный фон
     - Логотип Xbox (шар с X) и текст "XBOX" белыми/серыми буквами по центру
     - Маленький зелёный спиннер/индикатор по центру
+    
+    ВАЖНО: НЕ путать с Search Discover диалогом!
     """
     try:
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
         # Тёмный фон (яркость < 40)
         mean_brightness = np.mean(gray)
         if mean_brightness > 45:
+            return False
+        
+        # ИСКЛЮЧЕНИЕ: Проверяем нет ли яркого диалога в центре (Search Discover popup)
+        # Диалог обычно серый/белый прямоугольник с высоким контрастом к тёмному фону
+        dialog_area = gray[int(h*0.20):int(h*0.55), int(w*0.30):int(w*0.70)]
+        dialog_mean = np.mean(dialog_area)
+        dialog_bright_pixels = np.count_nonzero(dialog_area > 100) / dialog_area.size
+        
+        # Если в центре много ярких пикселей (>40%) - это вероятно диалог, НЕ Xbox logo
+        if dialog_bright_pixels > 0.40:
+            _log_debug(f"_detect_xbox_logo: исключение - яркий диалог в центре ({dialog_bright_pixels:.2%})")
+            return False
+        
+        # ИСКЛЮЧЕНИЕ 2: Проверяем нет ли зелёной кнопки (ODESLAT) - признак Search диалога
+        dialog_hsv = hsv[int(h*0.35):int(h*0.55), int(w*0.35):int(w*0.65)]
+        green_lower = np.array([35, 80, 80], dtype=np.uint8)
+        green_upper = np.array([85, 255, 255], dtype=np.uint8)
+        green_mask = cv2.inRange(dialog_hsv, green_lower, green_upper)
+        green_ratio = np.count_nonzero(green_mask) / green_mask.size
+        
+        if green_ratio > 0.02:  # Есть зелёная кнопка
+            _log_debug(f"_detect_xbox_logo: исключение - зелёная кнопка ({green_ratio:.4f})")
+            return False
+        
+        # ИСКЛЮЧЕНИЕ 3: Проверяем нет ли белых вкладок вверху (признак Discover экрана)
+        top_tabs = gray[int(h*0.06):int(h*0.12), int(w*0.45):int(w*0.95)]
+        top_tabs_white = np.count_nonzero(top_tabs > 180) / top_tabs.size
+        if top_tabs_white > 0.03:  # Много белого в области вкладок
+            _log_debug(f"_detect_xbox_logo: исключение - белые вкладки вверху ({top_tabs_white:.4f})")
             return False
         
         # Центральная область где должен быть логотип XBOX
@@ -205,10 +539,12 @@ def _detect_xbox_logo_screen(img: np.ndarray) -> bool:
             # Проверяем контраст - должен быть высокий (светлый логотип на тёмном фоне)
             std_center = np.std(center_roi)
             if std_center > 30:  # Высокий контраст
+                _log_debug(f"_detect_xbox_logo: ОБНАРУЖЕНО (white_ratio={white_ratio:.4f}, std={std_center:.1f})")
                 return True
         
         return False
-    except Exception:
+    except Exception as e:
+        _log_debug(f"_detect_xbox_logo error: {e}")
         return False
 
 
@@ -426,13 +762,15 @@ def _detect_xbox_queue(img: np.ndarray) -> bool:
 
 def _detect_title_screen(img: np.ndarray) -> bool:
     """
-    Детектирует титульный экран Fortnite ("Press any key to continue").
+    Детектирует титульный экран Fortnite ("Press any key to continue" / "LOGGING IN...").
     
-    Характеристики:
-    - Яркое изображение (много фиолетовых/пурпурных тонов)
-    - Надпись FORTNITE в верхней части (белая)
-    - НЕТ верхнего меню (PLAY SHOP LOCKER...) - это ключевое отличие от лобби!
-    - Обычно есть текст "Press any key" внизу
+    КЛЮЧЕВЫЕ ОТЛИЧИЯ от LOBBY:
+    - Большой логотип "FORTNITE" в верхней части (белые буквы)
+    - Много фиолетового/пурпурного цвета (сезонная тема)
+    - НЕТ верхнего меню (PLAY SHOP LOCKER...) 
+    - НЕТ карусели игр внизу
+    - Текст "LOGGING IN..." или "Press any key" внизу
+    - Информация об аккаунте внизу слева ("Signed in as: xxx")
     """
     try:
         h, w = img.shape[:2]
@@ -441,51 +779,88 @@ def _detect_title_screen(img: np.ndarray) -> bool:
         
         mean_brightness = np.mean(gray)
         
-        # Титульный экран яркий (не тёмная загрузка)
-        if mean_brightness < 60:
+        # Title screen яркий (50-120)
+        if mean_brightness < 40 or mean_brightness > 140:
+            _log_debug(f"_detect_title_screen: brightness={mean_brightness:.1f} вне диапазона - НЕТ")
             return False
         
-        # КЛЮЧЕВОЕ ОТЛИЧИЕ от лобби: НЕТ верхнего меню с текстом "PLAY SHOP LOCKER..."
-        # В лобби меню занимает верхние 5-12% экрана слева с белым текстом
-        # На титульном экране там обычно логотип FORTNITE или пустое пространство
-        top_menu_roi = gray[int(h*0.02):int(h*0.10), int(w*0.10):int(w*0.60)]
+        # ============================================================
+        # ИСКЛЮЧЕНИЕ 1: Проверяем НЕТ ЛИ верхнего меню PLAY/SHOP/LOCKER
+        # Это КЛЮЧЕВОЕ отличие - у Title Screen НЕТ меню!
+        # ============================================================
+        
+        # Верхнее меню в лобби: белый текст на тёмном/прозрачном фоне
+        top_menu_roi = gray[int(h*0.03):int(h*0.09), int(w*0.12):int(w*0.70)]
         top_menu_white = np.count_nonzero(top_menu_roi > 200) / top_menu_roi.size
-        top_menu_edges = cv2.Canny(top_menu_roi, 100, 200)
-        top_menu_edge_ratio = np.count_nonzero(top_menu_edges) / top_menu_edges.size
         
-        # Если много белого текста в верхнем меню (>3%) и много границ (>2%) - это лобби, НЕ title screen
-        has_top_menu = top_menu_white > 0.03 and top_menu_edge_ratio > 0.02
+        # Edges - буквы меню создают чёткие контуры
+        top_edges = cv2.Canny(top_menu_roi, 100, 200)
+        top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
         
-        _log_debug(f"_detect_title_screen: brightness={mean_brightness:.1f}, top_menu_white={top_menu_white:.4f}, edge_ratio={top_menu_edge_ratio:.4f}, has_menu={has_top_menu}")
+        _log_debug(f"_detect_title_screen: menu_white={top_menu_white:.4f}, edges={top_edge_ratio:.4f}")
         
-        if has_top_menu:
-            _log_debug("_detect_title_screen: НЕТ - есть верхнее меню (это лобби)")
+        # Если есть меню (белый текст + контуры) - это LOBBY, не title screen
+        if top_menu_white > 0.025 and top_edge_ratio > 0.02:
+            _log_debug("_detect_title_screen: НЕТ - есть верхнее меню (это LOBBY)")
             return False
         
-        # Проверяем наличие фиолетовых/пурпурных тонов (характерно для Title Screen Fortnite)
-        # Фиолетовый в HSV: H=125-165, высокая насыщенность
-        purple_lower = np.array([120, 30, 50], dtype=np.uint8)
-        purple_upper = np.array([165, 255, 255], dtype=np.uint8)
+        # ============================================================
+        # ИСКЛЮЧЕНИЕ 2: НЕТ карусели игр внизу  
+        # ============================================================
+        bottom_roi = gray[int(h*0.75):int(h*0.95), int(w*0.05):int(w*0.95)]
+        bottom_std = np.std(bottom_roi)
+        bottom_bright = np.count_nonzero(bottom_roi > 120) / bottom_roi.size
+        
+        _log_debug(f"_detect_title_screen: bottom_std={bottom_std:.1f}, bottom_bright={bottom_bright:.4f}")
+        
+        # Карусель создаёт высокий контраст (std > 50) и яркие карточки (bright > 20%)
+        if bottom_std > 50 and bottom_bright > 0.20:
+            _log_debug("_detect_title_screen: НЕТ - есть карусель (это LOBBY)")
+            return False
+        
+        # ============================================================
+        # ПРИЗНАК 1: Большой логотип FORTNITE в верхней части
+        # ============================================================
+        logo_roi = gray[int(h*0.08):int(h*0.35), int(w*0.25):int(w*0.75)]
+        logo_white = np.count_nonzero(logo_roi > 230) / logo_roi.size
+        
+        _log_debug(f"_detect_title_screen: logo_white={logo_white:.4f}")
+        
+        # ============================================================
+        # ПРИЗНАК 2: Много фиолетового цвета (сезонная тема)
+        # ============================================================
+        purple_lower = np.array([120, 30, 40], dtype=np.uint8)
+        purple_upper = np.array([170, 255, 255], dtype=np.uint8)
         mask_purple = cv2.inRange(hsv, purple_lower, purple_upper)
         purple_ratio = np.count_nonzero(mask_purple) / mask_purple.size
         
         _log_debug(f"_detect_title_screen: purple_ratio={purple_ratio:.4f}")
         
-        # Если много фиолетового (>5%) и НЕТ верхнего меню - это Title Screen
-        if purple_ratio > 0.05:
-            _log_debug("_detect_title_screen: ДА - много фиолетового, нет меню")
+        # ============================================================
+        # ПРИЗНАК 3: Текст внизу экрана (LOGGING IN... / Press any key)
+        # ============================================================
+        bottom_text_roi = gray[int(h*0.85):int(h*0.95), int(w*0.30):int(w*0.70)]
+        bottom_text_white = np.count_nonzero(bottom_text_roi > 200) / bottom_text_roi.size
+        
+        _log_debug(f"_detect_title_screen: bottom_text_white={bottom_text_white:.4f}")
+        
+        # ============================================================
+        # ФИНАЛЬНОЕ РЕШЕНИЕ
+        # ============================================================
+        
+        # Главный критерий: много фиолетового И большой логотип
+        if purple_ratio > 0.08 and logo_white > 0.03:
+            _log_debug("_detect_title_screen: ДА - фиолетовый фон + логотип")
             return True
         
-        # Также проверяем яркие разноцветные области + белый текст сверху (логотип FORTNITE)
-        # Верхняя центральная часть - там обычно большой белый логотип
-        top_center_roi = gray[int(h*0.05):int(h*0.25), int(w*0.25):int(w*0.75)]
-        white_logo = np.count_nonzero(top_center_roi > 220) / top_center_roi.size
+        # Альтернатива: много фиолетового + текст внизу (LOGGING IN...)
+        if purple_ratio > 0.10 and bottom_text_white > 0.005:
+            _log_debug("_detect_title_screen: ДА - фиолетовый + текст внизу")
+            return True
         
-        _log_debug(f"_detect_title_screen: white_logo={white_logo:.4f}")
-        
-        # Большой белый логотип (>8%) + яркий экран + нет верхнего меню
-        if white_logo > 0.08 and mean_brightness > 80:
-            _log_debug("_detect_title_screen: ДА - большой белый логотип")
+        # Большой белый логотип + нет меню + нет карусели
+        if logo_white > 0.06 and top_menu_white < 0.01 and bottom_std < 45:
+            _log_debug("_detect_title_screen: ДА - большой логотип, нет меню")
             return True
         
         _log_debug("_detect_title_screen: НЕТ")
@@ -495,18 +870,108 @@ def _detect_title_screen(img: np.ndarray) -> bool:
         return False
 
 
+def _detect_popup_notification(img: np.ndarray) -> bool:
+    """
+    Детектирует popup уведомления (новости, ивенты, промо).
+    
+    ПРИМЕРЫ:
+    - "KENNY'S POWER HOUR THIS SATURDAY..."
+    - Новости об обновлениях
+    - Промо-акции
+    
+    КЛЮЧЕВЫЕ ПРИЗНАКИ:
+    - Большая карточка слева (яркая картинка)
+    - Текстовый блок справа с заголовком и описанием
+    - Кнопка "PLAY NOW" или "Back" внизу
+    - НЕТ верхнего меню PLAY/SHOP/LOCKER
+    - Кнопка "Back" в правом нижнем углу
+    """
+    try:
+        h, w = img.shape[:2]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        mean_brightness = np.mean(gray)
+        
+        # Popup обычно средней яркости (40-90)
+        if mean_brightness < 30 or mean_brightness > 100:
+            return False
+        
+        # ============================================================
+        # ПРИЗНАК 1: НЕТ верхнего меню PLAY/SHOP/LOCKER
+        # У popup нет стандартного меню игры
+        # ============================================================
+        top_menu_roi = gray[int(h*0.02):int(h*0.08), int(w*0.12):int(w*0.70)]
+        menu_white = np.count_nonzero(top_menu_roi > 200) / top_menu_roi.size
+        
+        # Если есть меню - это не popup
+        if menu_white > 0.02:
+            return False
+        
+        # ============================================================
+        # ПРИЗНАК 2: Большая картинка СПРАВА (яркая, контрастная)
+        # ============================================================
+        right_roi = gray[int(h*0.10):int(h*0.75), int(w*0.55):int(w*0.98)]
+        right_mean = np.mean(right_roi)
+        right_std = np.std(right_roi)
+        right_bright = np.count_nonzero(right_roi > 100) / right_roi.size
+        
+        # ============================================================
+        # ПРИЗНАК 3: Текстовый блок СЛЕВА (белый текст на тёмном)
+        # ============================================================
+        left_roi = gray[int(h*0.15):int(h*0.65), int(w*0.05):int(w*0.50)]
+        left_mean = np.mean(left_roi)
+        left_white = np.count_nonzero(left_roi > 200) / left_roi.size
+        
+        _log_debug(f"_detect_popup: brightness={mean_brightness:.1f}, menu={menu_white:.4f}")
+        _log_debug(f"_detect_popup: right_mean={right_mean:.1f}, right_std={right_std:.1f}, right_bright={right_bright:.4f}")
+        _log_debug(f"_detect_popup: left_mean={left_mean:.1f}, left_white={left_white:.4f}")
+        
+        # ============================================================
+        # ПРИЗНАК 4: Кнопка "Back" в правом нижнем углу
+        # ============================================================
+        back_roi = gray[int(h*0.88):int(h*0.98), int(w*0.85):int(w*0.98)]
+        back_white = np.count_nonzero(back_roi > 180) / back_roi.size
+        
+        _log_debug(f"_detect_popup: back_button_white={back_white:.4f}")
+        
+        # ============================================================
+        # ФИНАЛЬНОЕ РЕШЕНИЕ
+        # ============================================================
+        
+        # Popup: картинка справа + текст слева + кнопка Back
+        has_right_image = right_std > 40 and right_bright > 0.30
+        has_left_text = left_white > 0.02 and left_mean < 80
+        has_back_button = back_white > 0.02
+        
+        if has_right_image and has_left_text:
+            _log_debug("_detect_popup: ДА - картинка справа + текст слева")
+            return True
+        
+        if has_left_text and has_back_button and menu_white < 0.01:
+            _log_debug("_detect_popup: ДА - текст слева + Back кнопка")
+            return True
+        
+        _log_debug("_detect_popup: НЕТ")
+        return False
+    except Exception as e:
+        _log_debug(f"_detect_popup error: {e}")
+        return False
+
+
 def _detect_fortnite_lobby(img: np.ndarray) -> bool:
     """
     Детектирует ОСНОВНОЕ лобби Fortnite с персонажем в центре.
     
-    Характерные признаки:
-    - Панель вкладок вверху: "PLAY SHOP LOCKER PASSES QUESTS COMPETE CAREER V-BUCKS"
-    - Персонаж в центре экрана (высокий контраст, человеческие пропорции)
-    - Карусель игр внизу (яркие карточки)
-    - Жёлтая кнопка PLAY слева внизу
-    - ЯРКИЙ экран (brightness > 40)
+    КЛЮЧЕВЫЕ ОТЛИЧИЯ от DISCOVER:
+    - ЯРКИЙ экран (brightness > 55) - у Discover тёмный фон (< 55)
+    - Персонаж в центре экрана (крупная фигура)
+    - Яркий/цветной фон (небо, строения и т.д.)
     
-    ВАЖНО: Это НЕ Discover! У Discover тёмный фон и Search bar.
+    КЛЮЧЕВЫЕ ОТЛИЧИЯ от TITLE_SCREEN:
+    - Есть верхнее меню PLAY/SHOP/LOCKER
+    - Есть карусель игр внизу
+    - Меньше фиолетового цвета
     """
     try:
         h, w = img.shape[:2]
@@ -515,63 +980,69 @@ def _detect_fortnite_lobby(img: np.ndarray) -> bool:
         
         mean_brightness = np.mean(gray)
         
-        # ЛОББИ с персонажем ЯРКОЕ (> 40), DISCOVER тёмный (< 60)
-        # Это ключевое отличие!
-        if mean_brightness < 40:
-            _log_debug(f"_detect_fortnite_lobby: слишком тёмный ({mean_brightness:.1f}) - это может быть Discover")
+        # ============================================================
+        # КЛЮЧЕВОЕ: LOBBY ЯРКОЕ (> 55)!
+        # DISCOVER тёмный (< 55), это главное отличие
+        # ============================================================
+        if mean_brightness < 55:
+            _log_debug(f"_detect_fortnite_lobby: тёмный экран ({mean_brightness:.1f}) - это DISCOVER, не LOBBY")
             return False
         
+        # ============================================================
         # 1. Проверяем верхнее меню (PLAY SHOP LOCKER...)
-        top_left = img[int(h*0.02):int(h*0.12), int(w*0.05):int(w*0.65)]
-        top_left_gray = cv2.cvtColor(top_left, cv2.COLOR_BGR2GRAY)
-        white_text_mask = top_left_gray > 200
-        white_text_ratio = np.count_nonzero(white_text_mask) / white_text_mask.size
-        top_edges = cv2.Canny(top_left_gray, 100, 200)
-        top_edge_ratio = np.count_nonzero(top_edges) / top_edges.size
+        # ============================================================
+        top_menu_roi = gray[int(h*0.03):int(h*0.10), int(w*0.12):int(w*0.70)]
+        menu_white = np.count_nonzero(top_menu_roi > 200) / top_menu_roi.size
+        menu_edges = cv2.Canny(top_menu_roi, 100, 200)
+        menu_edge_ratio = np.count_nonzero(menu_edges) / menu_edges.size
         
-        has_top_menu = white_text_ratio > 0.03 and top_edge_ratio > 0.02
+        has_top_menu = menu_white > 0.025 and menu_edge_ratio > 0.015
         
-        _log_debug(f"_detect_fortnite_lobby: brightness={mean_brightness:.1f}, menu_white={white_text_ratio:.4f}, edges={top_edge_ratio:.4f}")
+        _log_debug(f"_detect_fortnite_lobby: brightness={mean_brightness:.1f}, menu_white={menu_white:.4f}, edges={menu_edge_ratio:.4f}")
         
         if not has_top_menu:
-            _log_debug("_detect_fortnite_lobby: нет верхнего меню - НЕ лобби")
+            _log_debug("_detect_fortnite_lobby: нет верхнего меню - НЕ LOBBY")
             return False
         
-        # 2. Проверяем персонажа в центре экрана
-        # Центральная область (30-70% по ширине, 20-75% по высоте)
-        center_roi = gray[int(h*0.20):int(h*0.75), int(w*0.30):int(w*0.70)]
+        # ============================================================
+        # 2. Проверяем персонажа в центре (ЯРКАЯ центральная область)
+        # ============================================================
+        center_roi = gray[int(h*0.20):int(h*0.70), int(w*0.30):int(w*0.70)]
         center_std = np.std(center_roi)
         center_mean = np.mean(center_roi)
         
-        # Персонаж создаёт контраст (std > 30) и не слишком тёмный (mean > 50)
+        # В LOBBY центр яркий (> 70) из-за неба/фона и персонажа
+        # В DISCOVER центр тёмный (< 50) - карточки игр
+        has_bright_center = center_mean > 60
         has_character = center_std > 30 and center_mean > 50
         
-        _log_debug(f"_detect_fortnite_lobby: center_std={center_std:.1f}, center_mean={center_mean:.1f}, has_char={has_character}")
+        _log_debug(f"_detect_fortnite_lobby: center_mean={center_mean:.1f}, center_std={center_std:.1f}")
         
-        # 3. Проверяем карусель игр внизу (яркие карточки)
-        bottom_roi = gray[int(h*0.80):, int(w*0.05):int(w*0.95)]
+        # ============================================================  
+        # 3. Проверяем карусель игр внизу
+        # ============================================================
+        bottom_roi = gray[int(h*0.78):int(h*0.95), int(w*0.05):int(w*0.95)]
         bottom_std = np.std(bottom_roi)
-        has_carousel = bottom_std > 35
+        bottom_bright = np.count_nonzero(bottom_roi > 100) / bottom_roi.size
+        has_carousel = bottom_std > 35 and bottom_bright > 0.15
         
-        _log_debug(f"_detect_fortnite_lobby: bottom_std={bottom_std:.1f}, has_carousel={has_carousel}")
+        _log_debug(f"_detect_fortnite_lobby: bottom_std={bottom_std:.1f}, bottom_bright={bottom_bright:.4f}")
         
-        # 4. Ищем жёлтую кнопку PLAY слева внизу
-        bottom_left = img[int(h*0.70):int(h*0.95), int(w*0.05):int(w*0.40)]
-        bottom_left_hsv = cv2.cvtColor(bottom_left, cv2.COLOR_BGR2HSV)
-        yellow_lower = np.array([15, 100, 150], dtype=np.uint8)
-        yellow_upper = np.array([45, 255, 255], dtype=np.uint8)
-        mask_yellow = cv2.inRange(bottom_left_hsv, yellow_lower, yellow_upper)
-        yellow_ratio = np.count_nonzero(mask_yellow) / mask_yellow.size
-        has_play_button = yellow_ratio > 0.005
+        # ============================================================
+        # ФИНАЛЬНОЕ РЕШЕНИЕ
+        # ============================================================
         
-        _log_debug(f"_detect_fortnite_lobby: yellow_ratio={yellow_ratio:.4f}, has_play={has_play_button}")
-        
-        # Финальная проверка: меню + (персонаж ИЛИ карусель ИЛИ play button)
-        if has_top_menu and (has_character or has_carousel or has_play_button):
-            _log_debug("_detect_fortnite_lobby: ОБНАРУЖЕНО (лобби с персонажем)")
+        # Меню + яркий центр (персонаж на фоне) = LOBBY
+        if has_top_menu and has_bright_center and has_character:
+            _log_debug("_detect_fortnite_lobby: ДА - меню + яркий центр + персонаж")
             return True
         
-        _log_debug("_detect_fortnite_lobby: НЕ обнаружено")
+        # Меню + карусель + яркий экран = тоже LOBBY
+        if has_top_menu and has_carousel and mean_brightness > 60:
+            _log_debug("_detect_fortnite_lobby: ДА - меню + карусель + яркий экран")
+            return True
+        
+        _log_debug("_detect_fortnite_lobby: НЕТ")
         return False
     except Exception as e:
         _log_debug(f"_detect_fortnite_lobby error: {e}")
@@ -705,12 +1176,12 @@ def _detect_discover_screen(img: np.ndarray) -> bool:
     """
     Детектирует экран Discover (с Search Discover баром вверху).
     
-    Характерные признаки:
-    - Тёмный фон (синий/чёрный)
-    - Вкладки вверху: DISCOVER, FOLLOWING, BY EPIC, RECENTS, CATEGORIES
-    - Поле поиска "Search Discover" с иконкой лупы слева вверху
-    - Карточки игр/островов внизу
-    - НЕТ персонажа в центре (в отличие от LOBBY)
+    КЛЮЧЕВЫЕ ОТЛИЧИЯ от LOBBY:
+    - ТЁМНЫЙ фон (brightness < 55) - это ГЛАВНОЕ отличие!
+    - Search Discover бар слева вверху (серая полоса с текстом)
+    - Вкладки: DISCOVER, FOLLOWING, BY EPIC, RECENTS, CATEGORIES
+    - Карточки игр на тёмном фоне
+    - НЕТ персонажа в центре, НЕТ яркого неба
     """
     try:
         h, w = img.shape[:2]
@@ -719,61 +1190,97 @@ def _detect_discover_screen(img: np.ndarray) -> bool:
         
         mean_brightness = np.mean(gray)
         
-        # Discover экран обычно тёмный (20-70)
-        if mean_brightness < 20 or mean_brightness > 100:
+        # ============================================================
+        # КЛЮЧЕВОЕ: DISCOVER ТЁМНЫЙ (< 55)!
+        # LOBBY яркое (> 55), это главное отличие
+        # ============================================================
+        if mean_brightness > 55:
+            _log_debug(f"_detect_discover: слишком яркий ({mean_brightness:.1f}) - это LOBBY, не DISCOVER")
             return False
         
-        # 1. Проверяем наличие Search Discover бара слева вверху
-        # Область: 5-30% по ширине, 5-12% по высоте
-        search_bar_roi = img[int(h*0.05):int(h*0.12), int(w*0.04):int(w*0.30)]
-        search_gray = cv2.cvtColor(search_bar_roi, cv2.COLOR_BGR2GRAY)
+        if mean_brightness < 15:
+            _log_debug(f"_detect_discover: слишком тёмный ({mean_brightness:.1f}) - это загрузка")
+            return False
         
-        # Ищем серый/тёмный прямоугольник с белым текстом
-        # Search bar обычно серый (60-120 яркость)
-        search_mean = np.mean(search_gray)
+        # ============================================================
+        # 1. Проверяем верхнее меню (PLAY SHOP LOCKER...) 
+        # На Discover экране тоже есть это меню!
+        # ============================================================
+        top_menu_roi = gray[int(h*0.03):int(h*0.09), int(w*0.12):int(w*0.70)]
+        menu_white = np.count_nonzero(top_menu_roi > 200) / top_menu_roi.size
         
-        # Также смотрим на белые буквы внутри
-        white_in_search = np.count_nonzero(search_gray > 180) / search_gray.size
+        _log_debug(f"_detect_discover: brightness={mean_brightness:.1f}, menu_white={menu_white:.4f}")
         
-        _log_debug(f"_detect_discover: search_bar mean={search_mean:.1f}, white_text={white_in_search:.4f}")
+        # Должно быть меню (белый текст)
+        if menu_white < 0.015:
+            _log_debug("_detect_discover: нет верхнего меню - НЕ DISCOVER")
+            return False
         
-        # Search bar: серый фон (40-100) с белым текстом (> 1%)
-        has_search_bar = (40 < search_mean < 120) and (white_in_search > 0.01)
+        # ============================================================
+        # 2. Проверяем Search Discover бар (серая полоса слева вверху)
+        # ============================================================
+        search_bar_roi = gray[int(h*0.07):int(h*0.13), int(w*0.05):int(w*0.45)]
+        search_mean = np.mean(search_bar_roi)
+        search_white = np.count_nonzero(search_bar_roi > 180) / search_bar_roi.size
         
-        # 2. Проверяем вкладки справа (DISCOVER выделен белым/активный)
-        tabs_roi = img[int(h*0.06):int(h*0.12), int(w*0.45):int(w*0.95)]
-        tabs_gray = cv2.cvtColor(tabs_roi, cv2.COLOR_BGR2GRAY)
+        _log_debug(f"_detect_discover: search_bar mean={search_mean:.1f}, white={search_white:.4f}")
         
-        # Вкладки - белый текст на тёмном фоне
-        tabs_white = np.count_nonzero(tabs_gray > 200) / tabs_gray.size
-        tabs_edges = cv2.Canny(tabs_gray, 100, 200)
-        tabs_edge_ratio = np.count_nonzero(tabs_edges) / tabs_edges.size
+        # Search bar: серый фон (35-90) с белым текстом
+        has_search_bar = (30 < search_mean < 100) and (search_white > 0.008)
         
-        _log_debug(f"_detect_discover: tabs white={tabs_white:.4f}, edges={tabs_edge_ratio:.4f}")
+        # ============================================================
+        # 3. Проверяем вкладки справа (DISCOVER, FOLLOWING...)
+        # ============================================================
+        tabs_roi = gray[int(h*0.07):int(h*0.13), int(w*0.48):int(w*0.98)]
+        tabs_white = np.count_nonzero(tabs_roi > 200) / tabs_roi.size
         
-        # Вкладки: белый текст (> 3%) и контрастные границы (> 2%)
-        has_tabs = tabs_white > 0.03 and tabs_edge_ratio > 0.02
+        _log_debug(f"_detect_discover: tabs_white={tabs_white:.4f}")
         
-        # 3. Проверяем карточки игр внизу (яркие прямоугольники)
-        cards_roi = img[int(h*0.65):int(h*0.95), int(w*0.05):int(w*0.95)]
-        cards_gray = cv2.cvtColor(cards_roi, cv2.COLOR_BGR2GRAY)
-        cards_std = np.std(cards_gray)
+        has_tabs = tabs_white > 0.025
         
-        _log_debug(f"_detect_discover: cards contrast={cards_std:.1f}")
+        # ============================================================
+        # 4. Проверяем карточки игр (яркие прямоугольники на тёмном фоне)
+        # ============================================================
+        cards_roi = gray[int(h*0.15):int(h*0.90), int(w*0.05):int(w*0.95)]
+        cards_std = np.std(cards_roi)
+        cards_bright = np.count_nonzero(cards_roi > 120) / cards_roi.size
         
-        # Карточки создают высокий контраст (> 35)
-        has_cards = cards_std > 35
+        _log_debug(f"_detect_discover: cards_std={cards_std:.1f}, cards_bright={cards_bright:.4f}")
         
-        # 4. Финальная проверка: должен быть search bar ИЛИ (tabs + cards)
-        if has_search_bar:
-            _log_debug("_detect_discover: ОБНАРУЖЕНО (есть Search bar)")
+        # Карточки создают контраст на тёмном фоне
+        has_cards = cards_std > 35 and cards_bright > 0.10
+        
+        # ============================================================
+        # 5. Центр экрана ТЁМНЫЙ (нет яркого персонажа как в LOBBY)
+        # ============================================================
+        center_roi = gray[int(h*0.25):int(h*0.60), int(w*0.30):int(w*0.70)]
+        center_mean = np.mean(center_roi)
+        
+        _log_debug(f"_detect_discover: center_mean={center_mean:.1f}")
+        
+        # В DISCOVER центр относительно тёмный (карточки, а не яркое небо)
+        has_dark_center = center_mean < 80
+        
+        # ============================================================
+        # ФИНАЛЬНОЕ РЕШЕНИЕ
+        # ============================================================
+        
+        # Тёмный экран + Search bar + карточки = DISCOVER
+        if has_search_bar and has_cards and has_dark_center:
+            _log_debug("_detect_discover: ДА - search bar + cards + тёмный центр")
             return True
         
-        if has_tabs and has_cards:
-            _log_debug("_detect_discover: ОБНАРУЖЕНО (tabs + cards)")
+        # Тёмный экран + вкладки + карточки = тоже DISCOVER
+        if has_tabs and has_cards and has_dark_center:
+            _log_debug("_detect_discover: ДА - tabs + cards + тёмный центр")
             return True
         
-        _log_debug("_detect_discover: НЕ обнаружено")
+        # Search bar + меню + тёмный экран = DISCOVER
+        if has_search_bar and menu_white > 0.02 and mean_brightness < 50:
+            _log_debug("_detect_discover: ДА - search bar + меню + тёмный")
+            return True
+        
+        _log_debug("_detect_discover: НЕТ")
         return False
     except Exception as e:
         _log_debug(f"_detect_discover error: {e}")
@@ -782,41 +1289,96 @@ def _detect_discover_screen(img: np.ndarray) -> bool:
 
 def _detect_search_input_dialog(img: np.ndarray) -> bool:
     """
-    Детектирует диалог ввода кода острова.
+    Детектирует диалог ввода кода острова (Search Discover popup).
     
-    Характерные признаки:
-    - Модальное окно в центре (светлее фона)
-    - Поле ввода с мигающим курсором
-    - Кнопка отправки (ODESLAT/SEND/OK)
-    - Затемнённый фон
+    КЛЮЧЕВЫЕ ПРИЗНАКИ:
+    - Модальное ПРЯМОУГОЛЬНОЕ окно в центре (серый прямоугольник)
+    - Заголовок "Search Discover" белым текстом
+    - Поле ввода (белое прямоугольное)
+    - Кнопка ODESLAT (зелёная прямоугольная)
+    - Затемнённый фон вокруг
+    
+    НЕ ПУТАТЬ С:
+    - Экран загрузки с анимацией (ракета, круги)
+    - TITLE_SCREEN с логотипом
+    - Уведомления/popup окна
+    
+    ВАЖНО: Требуется ЗЕЛЁНАЯ кнопка или белое поле ввода!
     """
     try:
         h, w = img.shape[:2]
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
-        # Центральная область (диалог)
-        center_roi = gray[int(h*0.30):int(h*0.70), int(w*0.20):int(w*0.80)]
+        mean_brightness = np.mean(gray)
+        
+        # ============================================================
+        # ИСКЛЮЧЕНИЕ: Экран загрузки (тёмный с анимацией)
+        # На экране загрузки brightness < 25 и нет UI элементов
+        # ============================================================
+        if mean_brightness < 20:
+            _log_debug(f"_detect_search_input: слишком тёмный ({mean_brightness:.1f}) - это загрузка")
+            return False
+        
+        # Проверяем есть ли верхнее меню (PLAY SHOP LOCKER...)
+        # Search Input диалог появляется НА Discover экране, где есть меню
+        top_menu = gray[int(h*0.03):int(h*0.09), int(w*0.12):int(w*0.70)]
+        menu_white = np.count_nonzero(top_menu > 200) / top_menu.size
+        
+        # Если нет меню и экран очень тёмный - это загрузка
+        if menu_white < 0.01 and mean_brightness < 30:
+            _log_debug(f"_detect_search_input: нет меню + тёмный экран = загрузка")
+            return False
+        
+        # ============================================================
+        # ГЛАВНЫЙ ПРИЗНАК: ЗЕЛЁНАЯ КНОПКА ODESLAT
+        # ============================================================
+        # Кнопка ODESLAT находится в центре-нижней части диалога
+        button_roi = hsv[int(h*0.38):int(h*0.55), int(w*0.35):int(w*0.65)]
+        green_lower = np.array([35, 80, 80], dtype=np.uint8)
+        green_upper = np.array([85, 255, 255], dtype=np.uint8)
+        green_mask = cv2.inRange(button_roi, green_lower, green_upper)
+        green_ratio = np.count_nonzero(green_mask) / green_mask.size
+        
+        _log_debug(f"_detect_search_input: brightness={mean_brightness:.1f}, menu={menu_white:.4f}, green_button={green_ratio:.4f}")
+        
+        # Зелёная кнопка - надёжный признак диалога
+        if green_ratio > 0.03:
+            _log_debug("_detect_search_input: ОБНАРУЖЕНО (зелёная кнопка ODESLAT)")
+            return True
+        
+        # ============================================================
+        # ВТОРИЧНЫЙ ПРИЗНАК: Модальный диалог (светлый центр)
+        # ============================================================
+        # Центральная область должна быть СВЕТЛОЙ (серый диалог)
+        center_roi = gray[int(h*0.25):int(h*0.50), int(w*0.30):int(w*0.70)]
         center_mean = np.mean(center_roi)
+        center_std = np.std(center_roi)
         
-        # Края (затемнённый фон)
-        top_edge = np.mean(gray[0:int(h*0.20), :])
-        bottom_edge = np.mean(gray[int(h*0.80):, :])
-        edge_mean = (top_edge + bottom_edge) / 2
+        # Края должны быть ТЁМНЫМИ (затемнение)
+        left_edge = np.mean(gray[int(h*0.25):int(h*0.50), int(w*0.05):int(w*0.20)])
+        right_edge = np.mean(gray[int(h*0.25):int(h*0.50), int(w*0.80):int(w*0.95)])
+        edge_mean = (left_edge + right_edge) / 2
         
-        _log_debug(f"_detect_search_input: center={center_mean:.1f}, edges={edge_mean:.1f}")
+        _log_debug(f"_detect_search_input: center={center_mean:.1f}, edges={edge_mean:.1f}, diff={center_mean - edge_mean:.1f}")
         
-        # Диалог: центр светлее краёв минимум на 20
-        if center_mean > edge_mean + 20 and center_mean > 60:
-            # Проверяем наличие поля ввода (светлый прямоугольник)
-            input_area = gray[int(h*0.40):int(h*0.55), int(w*0.25):int(w*0.75)]
-            input_bright = np.count_nonzero(input_area > 200) / input_area.size
+        # Диалог: центр ЗНАЧИТЕЛЬНО светлее краёв (минимум +25)
+        # И центр должен быть серым (60-150), не слишком ярким
+        is_modal = (center_mean > edge_mean + 25) and (60 < center_mean < 150)
+        
+        if is_modal:
+            # Дополнительно: ищем белое поле ввода
+            input_roi = gray[int(h*0.30):int(h*0.40), int(w*0.32):int(w*0.68)]
+            input_very_bright = np.count_nonzero(input_roi > 200) / input_roi.size
             
-            _log_debug(f"_detect_search_input: input_bright={input_bright:.4f}")
+            _log_debug(f"_detect_search_input: modal detected, input_bright={input_very_bright:.4f}")
             
-            if input_bright > 0.1:  # Много белого (поле ввода)
-                _log_debug("_detect_search_input: ОБНАРУЖЕНО")
+            # Белое поле ввода (> 5% очень ярких пикселей)
+            if input_very_bright > 0.05:
+                _log_debug("_detect_search_input: ОБНАРУЖЕНО (модальный диалог + поле ввода)")
                 return True
         
+        _log_debug("_detect_search_input: НЕ обнаружено")
         return False
     except Exception as e:
         _log_debug(f"_detect_search_input error: {e}")
@@ -1122,7 +1684,12 @@ def detect_game_ready(page_or_img) -> bool:
 
 
 def _analyze_screen_state(img: np.ndarray) -> ScreenState:
-    """Анализирует состояние экрана."""
+    """
+    Анализирует состояние экрана.
+    
+    ГЛАВНЫЙ МЕТОД: Template matching по UI элементам из assets.
+    FALLBACK: Эвристический анализ цветов/яркости.
+    """
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -1142,16 +1709,35 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     
     _log_debug(f"Анализ экрана: размер={w}x{h}, яркость={mean_brightness:.1f}, контраст={std_brightness:.1f}")
     
-    # ВСЕГДА сохраняем debug скриншот в начале анализа
-    if _VISION_DEBUG:
-        _save_debug_image(img, "ANALYZING", debug_info)
+    # ============================================================
+    # МЕТОД 1: TEMPLATE MATCHING (ОСНОВНОЙ)
+    # ============================================================
+    # Ищем UI элементы на экране через template matching
+    found_elements = _detect_ui_elements(img)
     
-    # ПОРЯДОК ПРОВЕРКИ (критично!):
-    # 1. TITLE_SCREEN - яркий, фиолетовый, БЕЗ верхнего меню
-    # 2. LOBBY с персонажем - яркий (>40), меню + персонаж + карусель
-    # 3. DISCOVER - тёмный (<60), Search bar + карточки (перед общим lobby!)
-    # 4. LOBBY общий - яркий, меню + play button
-    # 5. Специфичные экраны (search input, results, preview)
+    if found_elements:
+        # Берём состояние от элемента с наивысшим приоритетом
+        best_element = found_elements[0]
+        state = best_element['state']
+        
+        _log_debug(f"Template matching: найдено {len(found_elements)} элементов")
+        _log_debug(f"  Лучший элемент: {best_element['name']} -> {state.name} (conf={best_element['confidence']:.3f})")
+        
+        debug_info["template_method"] = "True"
+        debug_info["best_element"] = f"{best_element['name']} ({best_element['confidence']:.0%})"
+        debug_info["elements_count"] = str(len(found_elements))
+        
+        _log_detection_result(state.name, f"найден UI элемент {best_element['name']}", 
+                             {"confidence": best_element['confidence'], **base_metrics})
+        _save_debug_image(img, state.name, debug_info, found_elements)
+        return state
+    
+    _log_debug("Template matching: UI элементы не найдены, переход к эвристикам")
+    debug_info["template_method"] = "False (fallback)"
+    
+    # ============================================================
+    # МЕТОД 2: ЭВРИСТИЧЕСКИЙ АНАЛИЗ (FALLBACK)
+    # ============================================================
     
     # 1. Проверяем Title Screen (фиолетовый экран БЕЗ верхнего меню)
     is_title = _detect_title_screen(img)
@@ -1159,7 +1745,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка TITLE_SCREEN: {is_title}")
     if is_title:
         _log_detection_result("TITLE_SCREEN", "титульный экран Fortnite", base_metrics)
-        _save_debug_image(img, "TITLE_SCREEN", debug_info)
+        _save_debug_image(img, "TITLE_SCREEN", debug_info, found_elements)
         return ScreenState.TITLE_SCREEN
     
     # 2. Проверяем лобби с персонажем (яркий экран, меню вверху, персонаж в центре)
@@ -1168,7 +1754,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка LOBBY (с персонажем): {is_lobby_char}")
     if is_lobby_char:
         _log_detection_result("LOBBY", "лобби Fortnite с персонажем", base_metrics)
-        _save_debug_image(img, "LOBBY", debug_info)
+        _save_debug_image(img, "LOBBY", debug_info, found_elements)
         return ScreenState.LOBBY
     
     # 3. Проверяем Discover экран (тёмный фон, Search Discover бар вверху)
@@ -1178,7 +1764,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка DISCOVER: {is_discover}")
     if is_discover:
         _log_detection_result("DISCOVER", "экран Discover с Search баром", base_metrics)
-        _save_debug_image(img, "DISCOVER", debug_info)
+        _save_debug_image(img, "DISCOVER", debug_info, found_elements)
         return ScreenState.DISCOVER
     
     # 4. Общая проверка лобби (меню + play button)
@@ -1187,7 +1773,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка FORTNITE_LOBBY: {is_lobby}")
     if is_lobby:
         _log_detection_result("LOBBY", "лобби Fortnite", base_metrics)
-        _save_debug_image(img, "LOBBY", debug_info)
+        _save_debug_image(img, "LOBBY", debug_info, found_elements)
         return ScreenState.LOBBY
     
     # 5. Проверяем Search Input Dialog (диалог ввода кода)
@@ -1196,7 +1782,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка SEARCH_INPUT: {is_search_input}")
     if is_search_input:
         _log_detection_result("SEARCH_INPUT", "диалог ввода кода острова", base_metrics)
-        _save_debug_image(img, "SEARCH_INPUT", debug_info)
+        _save_debug_image(img, "SEARCH_INPUT", debug_info, found_elements)
         return ScreenState.SEARCH_INPUT
     
     # 6. Проверяем Search Results (результаты поиска с карточками островов)
@@ -1205,7 +1791,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка SEARCH_RESULTS: {is_search_results}")
     if is_search_results:
         _log_detection_result("SEARCH_RESULTS", "результаты поиска островов", base_metrics)
-        _save_debug_image(img, "SEARCH_RESULTS", debug_info)
+        _save_debug_image(img, "SEARCH_RESULTS", debug_info, found_elements)
         return ScreenState.SEARCH_RESULTS
     
     # 7. Проверяем Island Preview (превью острова перед запуском)
@@ -1215,7 +1801,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка ISLAND_PREVIEW: {is_island_preview}")
     if is_island_preview:
         _log_detection_result("ISLAND_PREVIEW", "превью острова (SELECT/PLAY)", base_metrics)
-        _save_debug_image(img, "ISLAND_PREVIEW", debug_info)
+        _save_debug_image(img, "ISLAND_PREVIEW", debug_info, found_elements)
         return ScreenState.ISLAND_PREVIEW
     
     # ВАЖНО: Если экран ОЧЕНЬ яркий (>130) и это НЕ лобби - это может быть страница Xbox
@@ -1238,12 +1824,12 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
             debug_info["blue"] = f"{blue_ratio:.4f}"
             if blue_ratio > 0.01:
                 _log_detection_result("LOGIN_PAGE", "страница входа Microsoft", {"white": white_ratio*100, "blue": blue_ratio*100})
-                _save_debug_image(img, "LOGIN_PAGE", debug_info)
+                _save_debug_image(img, "LOGIN_PAGE", debug_info, found_elements)
                 return ScreenState.LOGIN_PAGE
         
         # Очень яркий экран но не login и не лобби - UNKNOWN
         _log_debug("  Состояние: UNKNOWN (очень яркий экран)")
-        _save_debug_image(img, "UNKNOWN_BRIGHT", debug_info)
+        _save_debug_image(img, "UNKNOWN_BRIGHT", debug_info, found_elements)
         return ScreenState.UNKNOWN
     
     # 1. CONNECTING оверлей (только на ОЧЕНЬ тёмном фоне < 60)
@@ -1253,7 +1839,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         _log_debug(f"  Проверка CONNECTING (яркость<60): {is_connecting}")
         if is_connecting:
             _log_detection_result("CONNECTING", "оверлей подключения", base_metrics)
-            _save_debug_image(img, "CONNECTING", debug_info)
+            _save_debug_image(img, "CONNECTING", debug_info, found_elements)
             return ScreenState.CONNECTING
     
     # 2. Xbox Queue (очередь Game Pass) - тёмный экран с рекламой и прогресс-баром
@@ -1263,7 +1849,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         _log_debug(f"  Проверка XBOX_QUEUE (яркость<80): {is_queue}")
         if is_queue:
             _log_detection_result("XBOX_QUEUE", "очередь Xbox Cloud Gaming", base_metrics)
-            _save_debug_image(img, "XBOX_QUEUE", debug_info)
+            _save_debug_image(img, "XBOX_QUEUE", debug_info, found_elements)
             return ScreenState.XBOX_QUEUE
     
     # 3. Xbox Logo Screen (большой логотип XBOX по центру) - ПРОВЕРЯЕМ ДО plane screen!
@@ -1273,7 +1859,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         _log_debug(f"  Проверка XBOX_LOGO (яркость<45): {is_xbox_logo}")
         if is_xbox_logo:
             _log_detection_result("XBOX_LOADING", "экран с логотипом XBOX", base_metrics)
-            _save_debug_image(img, "XBOX_LOADING", debug_info)
+            _save_debug_image(img, "XBOX_LOADING", debug_info, found_elements)
             return ScreenState.XBOX_LOADING
     
     # 4. Plane screen (зелёный самолёт)
@@ -1282,45 +1868,65 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка PLANE_SCREEN: {is_plane}")
     if is_plane:
         _log_detection_result("PLANE_SCREEN", "зелёный самолётик Xbox", base_metrics)
-        _save_debug_image(img, "PLANE_SCREEN", debug_info)
+        _save_debug_image(img, "PLANE_SCREEN", debug_info, found_elements)
         return ScreenState.PLANE_SCREEN
     
     # 5. Xbox loading (зелёный или белый логотип Xbox)
+    # ВАЖНО: Исключаем случаи когда есть диалог (Search Discover popup)
     if mean_brightness < 40:
-        # Проверка зелёного логотипа Xbox
-        xbox_lower = np.array([35, 100, 50], dtype=np.uint8)
-        xbox_upper = np.array([85, 255, 255], dtype=np.uint8)
-        mask_xbox = cv2.inRange(hsv, xbox_lower, xbox_upper)
-        xbox_green_ratio = np.count_nonzero(mask_xbox) / mask_xbox.size
-        debug_info["xbox_green"] = f"{xbox_green_ratio:.4f}"
+        # ИСКЛЮЧЕНИЕ: Проверяем нет ли яркого диалога в центре экрана
+        dialog_center = gray[int(h*0.20):int(h*0.55), int(w*0.30):int(w*0.70)]
+        dialog_bright = np.count_nonzero(dialog_center > 100) / dialog_center.size
         
-        # Проверка белого логотипа Xbox в правом нижнем углу
-        # Область: правая нижняя четверть экрана
-        bottom_right = img[int(h*0.5):, int(w*0.6):]
-        bottom_right_gray = cv2.cvtColor(bottom_right, cv2.COLOR_BGR2GRAY)
-        # Белые пиксели (яркость > 200)
-        white_mask = bottom_right_gray > 200
-        white_logo_ratio = np.count_nonzero(white_mask) / white_mask.size
-        debug_info["xbox_white_logo"] = f"{white_logo_ratio:.4f}"
+        # Проверяем нет ли зелёной кнопки (ODESLAT) в области диалога
+        dialog_hsv = hsv[int(h*0.35):int(h*0.55), int(w*0.35):int(w*0.65)]
+        green_btn_lower = np.array([35, 80, 80], dtype=np.uint8)
+        green_btn_upper = np.array([85, 255, 255], dtype=np.uint8)
+        green_btn_mask = cv2.inRange(dialog_hsv, green_btn_lower, green_btn_upper)
+        green_btn_ratio = np.count_nonzero(green_btn_mask) / green_btn_mask.size
         
-        _log_debug(f"  Проверка XBOX_LOADING (яркость<40): зелёный={xbox_green_ratio:.4f}, белый_лого={white_logo_ratio:.4f}")
+        has_dialog = dialog_bright > 0.35 or green_btn_ratio > 0.015
         
-        # Зелёный логотип ИЛИ белый логотип в углу
-        if xbox_green_ratio > 0.01 or (white_logo_ratio > 0.02 and white_logo_ratio < 0.3):
-            _log_detection_result("XBOX_LOADING", "загрузка Xbox Cloud Gaming", {"green": xbox_green_ratio*100, "white_logo": white_logo_ratio*100})
-            _save_debug_image(img, "XBOX_LOADING", debug_info)
-            return ScreenState.XBOX_LOADING
+        debug_info["dialog_bright"] = f"{dialog_bright:.4f}"
+        debug_info["green_btn"] = f"{green_btn_ratio:.4f}"
         
-        # Очень тёмный экран (почти чёрный) - тоже загрузка
-        if mean_brightness < 10 and std_brightness < 20:
-            _log_detection_result("LOADING", "очень тёмный экран", base_metrics)
-            _save_debug_image(img, "LOADING", debug_info)
-            return ScreenState.LOADING
-        
-        if std_brightness < 30:
-            _log_detection_result("LOADING", "тёмный экран загрузки", base_metrics)
-            _save_debug_image(img, "LOADING", debug_info)
-            return ScreenState.LOADING
+        if has_dialog:
+            _log_debug(f"  XBOX_LOADING пропущен - обнаружен диалог (bright={dialog_bright:.4f}, green_btn={green_btn_ratio:.4f})")
+        else:
+            # Проверка зелёного логотипа Xbox
+            xbox_lower = np.array([35, 100, 50], dtype=np.uint8)
+            xbox_upper = np.array([85, 255, 255], dtype=np.uint8)
+            mask_xbox = cv2.inRange(hsv, xbox_lower, xbox_upper)
+            xbox_green_ratio = np.count_nonzero(mask_xbox) / mask_xbox.size
+            debug_info["xbox_green"] = f"{xbox_green_ratio:.4f}"
+            
+            # Проверка белого логотипа Xbox в правом нижнем углу
+            # Область: правая нижняя четверть экрана
+            bottom_right = img[int(h*0.5):, int(w*0.6):]
+            bottom_right_gray = cv2.cvtColor(bottom_right, cv2.COLOR_BGR2GRAY)
+            # Белые пиксели (яркость > 200)
+            white_mask = bottom_right_gray > 200
+            white_logo_ratio = np.count_nonzero(white_mask) / white_mask.size
+            debug_info["xbox_white_logo"] = f"{white_logo_ratio:.4f}"
+            
+            _log_debug(f"  Проверка XBOX_LOADING (яркость<40): зелёный={xbox_green_ratio:.4f}, белый_лого={white_logo_ratio:.4f}")
+            
+            # Зелёный логотип ИЛИ белый логотип в углу
+            if xbox_green_ratio > 0.01 or (white_logo_ratio > 0.02 and white_logo_ratio < 0.3):
+                _log_detection_result("XBOX_LOADING", "загрузка Xbox Cloud Gaming", {"green": xbox_green_ratio*100, "white_logo": white_logo_ratio*100})
+                _save_debug_image(img, "XBOX_LOADING", debug_info, found_elements)
+                return ScreenState.XBOX_LOADING
+            
+            # Очень тёмный экран (почти чёрный) - тоже загрузка
+            if mean_brightness < 10 and std_brightness < 20:
+                _log_detection_result("LOADING", "очень тёмный экран", base_metrics)
+                _save_debug_image(img, "LOADING", debug_info, found_elements)
+                return ScreenState.LOADING
+            
+            if std_brightness < 30:
+                _log_detection_result("LOADING", "тёмный экран загрузки", base_metrics)
+                _save_debug_image(img, "LOADING", debug_info, found_elements)
+                return ScreenState.LOADING
     
     # 6. Титульный экран Fortnite (яркий, фиолетовый, с персонажами)
     is_title = _detect_title_screen(img)
@@ -1328,7 +1934,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка TITLE_SCREEN: {is_title}")
     if is_title:
         _log_detection_result("TITLE_SCREEN", "титульный экран Fortnite", base_metrics)
-        _save_debug_image(img, "TITLE_SCREEN", debug_info)
+        _save_debug_image(img, "TITLE_SCREEN", debug_info, found_elements)
         return ScreenState.TITLE_SCREEN
     
     # 6.5. Лобби Fortnite (жёлтая кнопка PLAY, персонаж, UI вкладки)
@@ -1337,7 +1943,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка FORTNITE_LOBBY: {is_lobby}")
     if is_lobby:
         _log_detection_result("LOBBY", "обнаружена кнопка PLAY и UI", base_metrics)
-        _save_debug_image(img, "LOBBY", debug_info)
+        _save_debug_image(img, "LOBBY", debug_info, found_elements)
         return ScreenState.LOBBY
     
     # 6. Страница входа Microsoft (белый фон с синими элементами)
@@ -1359,7 +1965,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         # Только если много белого И есть синий - это Microsoft login
         if blue_ratio > 0.01:
             _log_detection_result("LOGIN_PAGE", "страница входа Microsoft", {"white": white_ratio*100, "blue": blue_ratio*100})
-            _save_debug_image(img, "LOGIN_PAGE", debug_info)
+            _save_debug_image(img, "LOGIN_PAGE", debug_info, found_elements)
             return ScreenState.LOGIN_PAGE
     
     # 7. Игровой экран (Fortnite лобби или в игре)
@@ -1379,12 +1985,12 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
         
         if top_edge_ratio > 0.03 and bottom_edge_ratio > 0.03:
             _log_detection_result("IN_GAME", "в игре (много UI элементов)", {"top_ui": top_edge_ratio*100, "bottom_ui": bottom_edge_ratio*100})
-            _save_debug_image(img, "IN_GAME", debug_info)
+            _save_debug_image(img, "IN_GAME", debug_info, found_elements)
             return ScreenState.IN_GAME
         
         if top_edge_ratio > 0.01 or bottom_edge_ratio > 0.02:
             _log_detection_result("LOBBY", "обнаружен UI сверху/снизу", {"top_ui": top_edge_ratio*100, "bottom_ui": bottom_edge_ratio*100})
-            _save_debug_image(img, "LOBBY", debug_info)
+            _save_debug_image(img, "LOBBY", debug_info, found_elements)
             return ScreenState.LOBBY
     
     # 8. Меню/диалог
@@ -1397,7 +2003,7 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка MENU: center_bright={center_bright:.1f}, edge_bright={edge_bright:.1f}")
     if center_bright > edge_bright * 1.5 and center_bright > 80:
         _log_detection_result("MENU", "открыто меню/диалог", {"center": center_bright, "edge": edge_bright})
-        _save_debug_image(img, "MENU", debug_info)
+        _save_debug_image(img, "MENU", debug_info, found_elements)
         return ScreenState.MENU
     
     # 9. Ошибка
@@ -1415,12 +2021,12 @@ def _analyze_screen_state(img: np.ndarray) -> ScreenState:
     _log_debug(f"  Проверка ERROR: красный={red_ratio:.4f}")
     if red_ratio > 0.01:
         _log_detection_result("ERROR", "обнаружен красный цвет ошибки", {"red": red_ratio*100})
-        _save_debug_image(img, "ERROR", debug_info)
+        _save_debug_image(img, "ERROR", debug_info, found_elements)
         return ScreenState.ERROR
     
     # Не удалось определить состояние
     _log_detection_result("UNKNOWN", "не удалось определить", base_metrics)
-    _save_debug_image(img, "UNKNOWN", debug_info)
+    _save_debug_image(img, "UNKNOWN", debug_info, found_elements)
     return ScreenState.UNKNOWN
 
 
