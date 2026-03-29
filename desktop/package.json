@@ -1,35 +1,44 @@
 {
   "name": "epicbot-desktop",
-  "version": "2.1.0",
+  "version": "4.0.0",
+  "description": "EpicBot Desktop — Fortnite XP Farm Control Panel",
   "private": true,
-  "main": "electron/main.js",
+  "main": "dist-electron/main.js",
   "scripts": {
-    "start:renderer": "vite --config desktop/vite.config.js",
-    "start:electron": "cross-env UI_DEV=1 wait-on http://localhost:5173 && electron desktop/electron/main.js",
-    "dev": "concurrently -k -n RENDERER,ELECTRON \"npm:start:renderer\" \"npm:start:electron\"",
-    "build:renderer": "vite build --config desktop/vite.config.js"
+    "dev": "vite",
+    "build": "tsc && vite build && tsc -p tsconfig.electron.json",
+    "preview": "vite preview",
+    "electron:dev": "concurrently \"vite\" \"tsc -p tsconfig.electron.json --watch\" \"electron .\"",
+    "electron:build": "npm run build && electron-builder"
   },
   "dependencies": {
-    "@emotion/react": "11.11.4",
-    "@emotion/styled": "11.11.5",
-    "@mantine/core": "7.13.3",
-    "@mantine/hooks": "7.13.3",
-    "@mantine/notifications": "7.13.3",
-    "@tabler/icons-react": "3.19.0",
-    "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "react-router-dom": "^6.30.3"
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.0",
+    "lucide-react": "^0.441.0"
   },
   "devDependencies": {
-    "@types/node": "22.7.5",
-    "@types/react": "18.3.3",
-    "@types/react-dom": "18.3.0",
-    "@vitejs/plugin-react": "4.3.4",
-    "concurrently": "8.2.2",
-    "cross-env": "7.0.3",
-    "electron": "^40.0.0",
-    "typescript": "5.6.2",
-    "vite": "^7.3.1",
-    "wait-on": "7.2.0"
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^8.2.2",
+    "electron": "^31.4.0",
+    "electron-builder": "^24.13.3",
+    "postcss": "^8.4.41",
+    "tailwindcss": "^3.4.10",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2"
+  },
+  "build": {
+    "appId": "com.epicbot.desktop",
+    "productName": "EpicBot",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    }
   }
 }

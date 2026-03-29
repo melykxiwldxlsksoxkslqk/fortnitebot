@@ -2,12 +2,11 @@
 Canvas Navigation Module - умная навигация в канвас-стриме Xbox Cloud Gaming.
 
 Этот модуль предоставляет высокоуровневую абстракцию для работы с игровым UI,
-который рендерится на canvas элементе (а не в DOM). Использует computer vision
-для детекции элементов и эмулирует геймпад/клавиатурный ввод.
+который рендерится на canvas элементе (а не в DOM). Использует DOM-селекторы
+и эвристики для определения состояния и эмулирует геймпад/клавиатурный ввод.
 
 Особенности:
 - Автоматическое определение состояния экрана (лобби, меню, игра)
-- Адаптивное обнаружение UI элементов через template matching
 - Эмуляция геймпада через keyboard (D-pad навигация)
 - Система подтверждения действий (ждёт изменения экрана)
 - Retry логика с умным fallback
@@ -15,17 +14,12 @@ Canvas Navigation Module - умная навигация в канвас-стр�
 
 import time
 import random
-import hashlib
-import os
 from enum import Enum, auto
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Callable, Dict, List, Tuple, Any, Union
-from functools import lru_cache
+from typing import TYPE_CHECKING, Optional, Callable, Dict, List, Tuple
 
 if TYPE_CHECKING:
     from playwright.sync_api import Page
-
-import numpy as np
 
 from ..core.logger import get_logger
 
@@ -50,6 +44,7 @@ class ScreenState(Enum):
     IN_GAME = auto()
     PAUSE_MENU = auto()
     ERROR_DIALOG = auto()
+    POPUP = auto()              # Popup уведомление (новости, ивенты)
 
 
 class NavigationDirection(Enum):
@@ -130,7 +125,6 @@ class ScreenSnapshot:
     elements: List[CanvasElement] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
     frame_hash: str = ""
-    raw_image: Optional[np.ndarray] = None
     
     def has_element(self, name: str) -> bool:
         """Проверяет наличие элемента."""
@@ -180,24 +174,14 @@ class CanvasNavigator:
         self,
         page: "Page",
         status_callback: Optional[Callable[[str], None]] = None,
-        vision_module = None,
         use_gamepad: bool = True,  # Использовать виртуальный геймпад если доступен
     ):
         self.page = page
         self.status_callback = status_callback
-        self._vision = vision_module
         self._last_snapshot: Optional[ScreenSnapshot] = None
         self._action_history: List[str] = []
         self._retry_counts: Dict[str, int] = {}
         self._gamepad = None
-        
-        # Загрузить vision если не передан
-        if self._vision is None:
-            try:
-                from ..vision import detection
-                self._vision = detection
-            except ImportError:
-                logger.warning("Vision module not available")
         
         # Инициализация виртуального геймпада
         if use_gamepad:
@@ -300,7 +284,7 @@ class CanvasNavigator:
         """
         Убедиться что канвас имеет фокус для ввода.
         
-        Делает несколько кликов по центру экрана для захвата фокуса.
+        Один клик по центру для захвата фокуса Playwright (необходим для передачи input).
         
         Returns:
             True если фокус установлен
@@ -316,12 +300,10 @@ class CanvasNavigator:
         cx, cy = x + w // 2, y + h // 2
         
         try:
-            # Несколько кликов по центру для надёжного захвата фокуса
+            # Один клик для захвата фокуса Playwright (минимум для работы ввода)
             self._log_input("FOCUS", f"Canvas center ({cx}, {cy})", f"size={w}x{h}")
-            for i in range(3):
-                self.page.mouse.click(cx, cy)
-                self._log_input("CLICK", f"({cx}, {cy})", f"focus click {i+1}/3")
-                self.page.wait_for_timeout(150)
+            self.page.mouse.click(cx, cy)
+            self.page.wait_for_timeout(300)
             
             self._log_action(f"focus_canvas({cx}, {cy})")
             return True
@@ -329,25 +311,6 @@ class CanvasNavigator:
         except Exception as e:
             logger.error(f"Failed to focus canvas: {e}")
             return False
-    
-    def capture_frame(self) -> Optional[np.ndarray]:
-        """Захватить текущий кадр канваса."""
-        if self._vision is None:
-            return None
-        
-        try:
-            return self._vision.capture_page_bgr(self.page)
-        except Exception as e:
-            logger.error(f"Frame capture failed: {e}")
-            return None
-    
-    def _compute_frame_hash(self, img: np.ndarray) -> str:
-        """Вычислить хеш кадра для сравнения."""
-        if img is None:
-            return ""
-        # Уменьшаем и хешируем
-        small = img[::10, ::10].tobytes()
-        return hashlib.md5(small).hexdigest()[:16]
     
     # ========================================================================
     # SCREEN STATE DETECTION
@@ -357,108 +320,49 @@ class CanvasNavigator:
         """
         Определить текущее состояние экрана.
         
-        Использует template matching и эвристики для определения
+        Использует DOM-эвристики для определения
         в каком экране сейчас находится игра.
         """
-        img = self.capture_frame()
         elements: List[CanvasElement] = []
-        state = ScreenState.UNKNOWN
         
-        if img is None:
-            return ScreenSnapshot(state=state)
-        
-        frame_hash = self._compute_frame_hash(img)
-        
-        # Список шаблонов для поиска с их state-маппингом
-        templates_to_check = [
-            # (template_path, element_name, associated_state, roi)
-            ('assets/play_button_yellow.png', 'play_button', ScreenState.LOBBY, None),
-            ('assets/play_button.png', 'play_button_alt', ScreenState.LOBBY, None),
-            ('assets/search_icon.png', 'search_icon', ScreenState.LOBBY, (0, 0, 0.4, 0.3)),  # Увеличен ROI для лупы
-            ('assets/search_discover_bar.png', 'search_bar', ScreenState.DISCOVER, (0, 0, 0.5, 0.2)),  # Search Discover бар
-            ('assets/search_dialog.png', 'search_dialog', ScreenState.SEARCH_INPUT, (0.15, 0.15, 0.85, 0.7)),  # Диалог поиска
-            ('assets/odeslat_button.png', 'odeslat_button', ScreenState.SEARCH_INPUT, (0.25, 0.3, 0.75, 0.65)),  # Кнопка ODESLAT
-            ('assets/search_input_field.png', 'search_input_field', ScreenState.SEARCH_INPUT, (0.2, 0.2, 0.8, 0.55)),  # Поле ввода
-            ('assets/island_code_input_field.png', 'search_input', ScreenState.SEARCH_PANEL, (0, 0, 1, 0.5)),
-            ('assets/select_button.png', 'select_button', ScreenState.ISLAND_PREVIEW, None),
-            ('assets/loading_spinner.png', 'loading', ScreenState.LOADING, None),
-            ('assets/error_dialog.png', 'error', ScreenState.ERROR_DIALOG, None),
-        ]
-        
-        if self._vision:
-            for template_path, elem_name, assoc_state, roi in templates_to_check:
-                # Пропускаем несуществующие файлы шаблонов
-                full_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), template_path)
-                if not os.path.exists(full_path):
-                    continue
-                    
-                try:
-                    result = self._vision.find_template(
-                        img, 
-                        template_path, 
-                        confidence=0.65,
-                        roi=roi
-                    )
-                    if result:
-                        x, y, w, h = result
-                        elements.append(CanvasElement(
-                            name=elem_name,
-                            x=x, y=y, width=w, height=h,
-                            template_path=template_path
-                        ))
-                        # Определяем state по найденным элементам
-                        if state == ScreenState.UNKNOWN:
-                            state = assoc_state
-                except Exception as e:
-                    logger.debug(f"Template check failed for {template_path}: {e}")
-        
-        # Эвристики если template matching не дал результата
-        if state == ScreenState.UNKNOWN:
-            state = self._detect_state_heuristic(img)
+        # Определяем state по DOM-эвристикам
+        state = self._detect_state_dom()
         
         snapshot = ScreenSnapshot(
             state=state,
             elements=elements,
-            frame_hash=frame_hash,
-            raw_image=img
+            frame_hash="",
         )
         
         self._last_snapshot = snapshot
         return snapshot
     
-    def _detect_state_heuristic(self, img: np.ndarray) -> ScreenState:
-        """Эвристическое определение состояния по цветам/паттернам."""
-        if img is None:
-            return ScreenState.UNKNOWN
-        
-        h, w = img.shape[:2]
-        
-        # Анализируем среднюю яркость и цвета
+    def _detect_state_dom(self) -> ScreenState:
+        """Определение состояния экрана по DOM-признакам."""
         try:
-            # Центральная область
-            center_roi = img[h//4:3*h//4, w//4:3*w//4]
-            avg_brightness = np.mean(center_roi)
+            # Проверяем наличие canvas стрима
+            canvas = self.page.locator('canvas#StreamCanvas, canvas[data-testid="stream-canvas"]')
+            canvas_visible = False
+            try:
+                canvas_visible = canvas.count() > 0 and canvas.first.is_visible(timeout=1000)
+            except Exception:
+                pass
             
-            # Верхняя область (обычно UI)
-            top_roi = img[0:h//5, :]
-            top_brightness = np.mean(top_roi)
+            if not canvas_visible:
+                # Нет canvas — проверяем загрузку
+                loading = self.page.locator('.loading, [data-testid="loading"]')
+                try:
+                    if loading.count() > 0 and loading.first.is_visible(timeout=500):
+                        return ScreenState.LOADING
+                except Exception:
+                    pass
+                return ScreenState.UNKNOWN
             
-            # Очень тёмный экран = загрузка
-            if avg_brightness < 30:
-                return ScreenState.LOADING
+            # Canvas виден — считаем что в игре
+            return ScreenState.IN_GAME
             
-            # Яркий верх с тёмным центром = меню/лобби
-            if top_brightness > 100 and avg_brightness < 80:
-                return ScreenState.LOBBY
-            
-            # Относительно равномерная яркость = в игре
-            if 50 < avg_brightness < 150:
-                return ScreenState.IN_GAME
-                
         except Exception:
-            pass
-        
-        return ScreenState.UNKNOWN
+            return ScreenState.UNKNOWN
     
     def wait_for_state(
         self,
@@ -536,77 +440,83 @@ class CanvasNavigator:
         """
         Нажать кнопку геймпада.
         
+        Использует ТОЛЬКО виртуальный геймпад.
+        
         Args:
             button: Кнопка для нажатия
             hold_ms: Время удержания (0 = tap)
         """
-        key = button.value
-        
-        try:
-            if hold_ms > 0:
-                self.page.keyboard.down(key)
-                self.page.wait_for_timeout(hold_ms)
-                self.page.keyboard.up(key)
-            else:
-                self.page.keyboard.press(key)
-            
-            self._log_action(f"button({button.name})")
-            self.page.wait_for_timeout(TIMEOUTS['action_cooldown'])
-            
-        except Exception as e:
-            logger.error(f"Button press failed: {e}")
+        if self._gamepad:
+            try:
+                from .gamepad import XboxButton
+                # Маппинг GamepadButton -> XboxButton
+                gamepad_map = {
+                    GamepadButton.A: XboxButton.A,
+                    GamepadButton.B: XboxButton.B,
+                    GamepadButton.X: XboxButton.X,
+                    GamepadButton.Y: XboxButton.Y,
+                    GamepadButton.LB: XboxButton.LB,
+                    GamepadButton.RB: XboxButton.RB,
+                    GamepadButton.LT: XboxButton.LT,
+                    GamepadButton.RT: XboxButton.RT,
+                    GamepadButton.START: XboxButton.START,
+                    GamepadButton.SELECT: XboxButton.BACK,
+                    GamepadButton.DPAD_UP: XboxButton.DPAD_UP,
+                    GamepadButton.DPAD_DOWN: XboxButton.DPAD_DOWN,
+                    GamepadButton.DPAD_LEFT: XboxButton.DPAD_LEFT,
+                    GamepadButton.DPAD_RIGHT: XboxButton.DPAD_RIGHT,
+                }
+                xbox_btn = gamepad_map.get(button)
+                if xbox_btn:
+                    self._gamepad.press_button(xbox_btn, duration_ms=max(hold_ms, 100))
+                    self._log_action(f"gamepad_button({button.name})")
+                    self.page.wait_for_timeout(TIMEOUTS['action_cooldown'])
+                    return
+            except Exception as e:
+                logger.error(f"Gamepad button press failed: {e}")
+        else:
+            logger.warning(f"Gamepad not available, cannot press {button.name}")
     
     def navigate(self, direction: NavigationDirection, times: int = 1) -> None:
         """
         Навигация в направлении (D-pad).
         
+        Использует ТОЛЬКО виртуальный геймпад.
+        
         Args:
             direction: Направление
             times: Сколько раз нажать
         """
-        # Приоритет: виртуальный геймпад
-        if self._gamepad:
-            try:
-                from .gamepad import XboxButton
-                direction_map = {
-                    NavigationDirection.UP: XboxButton.DPAD_UP,
-                    NavigationDirection.DOWN: XboxButton.DPAD_DOWN,
-                    NavigationDirection.LEFT: XboxButton.DPAD_LEFT,
-                    NavigationDirection.RIGHT: XboxButton.DPAD_RIGHT,
-                }
-                btn = direction_map.get(direction)
-                if btn:
-                    for _ in range(times):
-                        self._gamepad.press_button(btn)
-                        self.page.wait_for_timeout(TIMEOUTS['navigation_delay'])
-                    self._log_action(f"gamepad_navigate({direction.name}, {times})")
-                    return
-            except Exception as e:
-                logger.debug(f"Gamepad navigation failed, using keyboard: {e}")
+        if not self._gamepad:
+            logger.warning(f"Gamepad not available, cannot navigate {direction.name}")
+            return
         
-        # Fallback: клавиатура
-        keys = NAVIGATION_KEYS[direction]
-        key = keys[0]  # Используем Arrow keys
-        
-        for _ in range(times):
-            try:
-                self.page.keyboard.press(key)
-                self.page.wait_for_timeout(TIMEOUTS['navigation_delay'])
-            except Exception as e:
-                logger.error(f"Navigation failed: {e}")
-        
-        self._log_action(f"navigate({direction.name}, {times})")
+        try:
+            from .gamepad import XboxButton
+            direction_map = {
+                NavigationDirection.UP: XboxButton.DPAD_UP,
+                NavigationDirection.DOWN: XboxButton.DPAD_DOWN,
+                NavigationDirection.LEFT: XboxButton.DPAD_LEFT,
+                NavigationDirection.RIGHT: XboxButton.DPAD_RIGHT,
+            }
+            btn = direction_map.get(direction)
+            if btn:
+                for _ in range(times):
+                    self._gamepad.press_button(btn)
+                    self.page.wait_for_timeout(TIMEOUTS['navigation_delay'])
+                self._log_action(f"gamepad_navigate({direction.name}, {times})")
+        except Exception as e:
+            logger.error(f"Gamepad navigation failed: {e}")
     
     def confirm(self) -> bool:
         """
-        Подтвердить текущий выбор (A / Enter).
+        Подтвердить текущий выбор (кнопка A геймпада).
         
         Returns:
             True если экран изменился после подтверждения
         """
-        self._emit("Подтверждаю выбор")
+        self._emit("Подтверждаю выбор (A)")
         
-        # Приоритет: виртуальный геймпад
         if self._gamepad:
             try:
                 from .gamepad import XboxButton
@@ -614,34 +524,30 @@ class CanvasNavigator:
                 self.page.wait_for_timeout(TIMEOUTS['confirm_delay'])
                 return self.wait_for_screen_change(timeout=3000)
             except Exception as e:
-                logger.debug(f"Gamepad confirm failed: {e}")
+                logger.error(f"Gamepad confirm failed: {e}")
         
-        # Fallback: клавиатура
-        self.press_button(GamepadButton.A)
-        self.page.wait_for_timeout(TIMEOUTS['confirm_delay'])
-        return self.wait_for_screen_change(timeout=3000)
+        logger.warning("Gamepad not available for confirm")
+        return False
     
     def cancel(self) -> bool:
         """
-        Отменить / вернуться назад (B / Escape).
+        Отменить / вернуться назад (кнопка B геймпада).
         
         Returns:
             True если экран изменился
         """
-        self._emit("Отмена / назад")
+        self._emit("Отмена / назад (B)")
         
-        # Приоритет: виртуальный геймпад
         if self._gamepad:
             try:
                 from .gamepad import XboxButton
                 self._gamepad.press_button(XboxButton.B)
                 return self.wait_for_screen_change(timeout=2000)
             except Exception as e:
-                logger.debug(f"Gamepad cancel failed: {e}")
+                logger.error(f"Gamepad cancel failed: {e}")
         
-        # Fallback: клавиатура
-        self.press_button(GamepadButton.B)
-        return self.wait_for_screen_change(timeout=2000)
+        logger.warning("Gamepad not available for cancel")
+        return False
     
     def type_text(self, text: str, delay: int = 50) -> None:
         """
@@ -659,56 +565,24 @@ class CanvasNavigator:
     
     def click_at(self, x: int, y: int) -> None:
         """
-        Клик по координатам на канвасе.
-        
-        Args:
-            x, y: Координаты
+        DEPRECATED: Клик по координатам отключён.
+        Используйте геймпад для навигации.
         """
-        bounds = self.get_canvas_bounds()
-        if bounds:
-            # Убеждаемся что координаты внутри канваса
-            cx, cy, cw, ch = bounds
-            x = max(cx, min(x, cx + cw))
-            y = max(cy, min(y, cy + ch))
-        
-        try:
-            self.page.mouse.click(x, y)
-            self._log_action(f"click({x}, {y})")
-            self.page.wait_for_timeout(TIMEOUTS['action_cooldown'])
-        except Exception as e:
-            logger.error(f"Click failed: {e}")
+        logger.warning(f"click_at({x}, {y}) вызван, но мышь отключена. Используйте геймпад.")
     
     def click_element(self, element: CanvasElement) -> bool:
         """
-        Клик по найденному элементу.
+        DEPRECATED: Клик по элементу отключён.
+        Используйте геймпад для навигации к элементу и confirm().
         
         Args:
-            element: Элемент для клика
+            element: Элемент (игнорируется)
             
         Returns:
             True если экран изменился
         """
-        cx, cy = element.center
-        
-        # Получаем offset канваса для корректировки координат
-        # Координаты элемента относительные к скриншоту, нужно добавить offset канваса
-        bounds = self.get_canvas_bounds()
-        if bounds:
-            canvas_x, canvas_y = bounds[0], bounds[1]
-            cx += canvas_x
-            cy += canvas_y
-        
-        self._emit(f"Клик по {element.name} ({cx}, {cy})")
-        
-        try:
-            # Сначала клик для фокуса, потом по элементу
-            self.page.mouse.click(cx, cy)
-            self._log_action(f"click_element({element.name}, {cx}, {cy})")
-            self.page.wait_for_timeout(TIMEOUTS['action_cooldown'])
-        except Exception as e:
-            logger.error(f"Click element failed: {e}")
-            
-        return self.wait_for_screen_change(timeout=3000)
+        self._emit(f"click_element({element.name}) → заменён на gamepad A")
+        return self.confirm()
     
     # ========================================================================
     # HIGH-LEVEL ACTIONS
@@ -716,135 +590,32 @@ class CanvasNavigator:
     
     def open_search(self) -> bool:
         """
-        Открыть панель поиска островов.
+        Открыть панель поиска островов через ГЕЙМПАД.
         
-        Пробует несколько методов:
-        1. Клик по иконке поиска (vision - новый метод)
-        2. Клик по иконке поиска (template matching)
-        3. Хоткей /
-        4. Tab навигация
+        В Fortnite на Discover экране LT открывает Search напрямую.
         
         Returns:
             True если поиск открыт
         """
-        self._emit("Открываю поиск островов")
+        self._emit("Открываю поиск островов через геймпад")
         
-        # Метод 1: Новый Vision метод - find_search_icon из vision.state
-        try:
-            from ..vision.state import find_search_icon
-            search_result = find_search_icon(self.page)
-            if search_result:
-                x, y, w, h = search_result
-                
-                # Получаем offset канваса для корректировки координат
-                canvas_bounds = self.get_canvas_bounds()
-                canvas_x, canvas_y = 0, 0
-                if canvas_bounds:
-                    canvas_x, canvas_y = canvas_bounds[0], canvas_bounds[1]
-                
-                # Координаты относительно всего окна
-                click_x = canvas_x + x + w // 2
-                click_y = canvas_y + y + h // 2
-                
-                self._emit(f"Найдена иконка поиска через vision.find_search_icon at ({x}, {y}), клик по ({click_x}, {click_y})")
-                
-                # Сначала устанавливаем фокус на канвас
-                self.page.mouse.click(canvas_x + 100, canvas_y + 100)
-                self.page.wait_for_timeout(200)
-                
-                # Кликаем по центру иконки
-                self.page.mouse.click(click_x, click_y)
-                self.page.wait_for_timeout(800)
-                
-                # Проверяем что поиск открылся
-                new_snapshot = self.detect_screen_state()
-                if new_snapshot.state == ScreenState.SEARCH_PANEL or new_snapshot.has_element('search_input'):
-                    self._emit("Панель поиска открыта успешно!")
-                    return True
-                
-                # Попробуем ещё раз кликнуть
-                self._emit("Первый клик не открыл панель, пробуем ещё раз...")
-                self.page.mouse.click(click_x, click_y)
-                self.page.wait_for_timeout(800)
-                
-                new_snapshot = self.detect_screen_state()
-                if new_snapshot.state == ScreenState.SEARCH_PANEL or new_snapshot.has_element('search_input'):
-                    self._emit("Панель поиска открыта успешно!")
-                    return True
-                    
-                self._emit("Клик по лупе не открыл панель поиска, пробуем другие методы...")
-        except Exception as e:
-            self._emit(f"Ошибка в find_search_icon: {e}")
+        if not self._gamepad:
+            self._emit("❌ Геймпад недоступен!")
+            return False
         
-        # Метод 2: Навигация через геймпад (D-pad)
-        if self._gamepad:
-            self._emit("Пробую навигацию через геймпад (D-pad вверх + влево)...")
-            try:
-                # В Fortnite лобби поиск в верхней левой части
-                # Сначала вверх чтобы попасть в верхнее меню
-                self._gamepad.navigate_up(3, delay_ms=150)
-                self.page.wait_for_timeout(300)
-                
-                # Потом влево к иконке поиска
-                self._gamepad.navigate_left(2, delay_ms=150)
-                self.page.wait_for_timeout(300)
-                
-                # Подтверждаем
-                self._gamepad.confirm()
-                self.page.wait_for_timeout(800)
-                
-                new_snapshot = self.detect_screen_state()
-                if new_snapshot.state == ScreenState.SEARCH_PANEL or new_snapshot.has_element('search_input'):
-                    self._emit("Панель поиска открыта через геймпад!")
-                    return True
-            except Exception as e:
-                self._emit(f"Ошибка навигации геймпадом: {e}")
+        from .gamepad import XboxButton
         
-        # Метод 3: Template matching через detect_screen_state
-        snapshot = self.detect_screen_state()
-        search_icon = snapshot.get_element('search_icon')
+        # Метод 1: LT — в Fortnite на Discover экране это открывает Search
+        self._emit("Пробую LT (быстрый поиск)...")
+        self._gamepad.press_button(XboxButton.LT, duration_ms=100)
+        self.page.wait_for_timeout(1500)
         
-        if search_icon:
-            self._emit("Найдена иконка поиска через template matching")
-            self.click_element(search_icon)
-            self.page.wait_for_timeout(500)
-            
-            # Проверяем что поиск открылся
-            new_snapshot = self.detect_screen_state()
-            if new_snapshot.state == ScreenState.SEARCH_PANEL:
-                return True
-        
-        # Метод 3: Хоткей /
-        self._emit("Пробую хоткей /")
-        try:
-            self.page.keyboard.press('/')
-            self.page.wait_for_timeout(500)
-            
-            new_snapshot = self.detect_screen_state()
-            if new_snapshot.has_element('search_input'):
-                return True
-        except Exception:
-            pass
-        
-        # Метод 4: Tab для переключения фокуса + навигация
-        self._emit("Пробую Tab навигацию")
-        try:
-            self.page.keyboard.press('Tab')
-            self.page.wait_for_timeout(200)
-            self.confirm()
-            
-            new_snapshot = self.detect_screen_state()
-            if new_snapshot.state == ScreenState.SEARCH_PANEL:
-                return True
-        except Exception:
-            pass
-        
-        self._emit("Не удалось открыть поиск")
-        return False
+        return True
     
     def type_island_code(self, code: str) -> bool:
         """
         Ввести код острова.
+        Клавиатура используется ТОЛЬКО для ввода текста.
         
         Args:
             code: Код острова (например "1234-5678-9012")
@@ -853,27 +624,6 @@ class CanvasNavigator:
             True если код введён
         """
         self._emit(f"Ввожу код острова: {code}")
-        
-        # Убедимся что мы в панели поиска
-        snapshot = self.detect_screen_state()
-        
-        # Найти и кликнуть поле ввода
-        input_field = snapshot.get_element('search_input')
-        if input_field:
-            self._emit(f"Найдено поле ввода, кликаю...")
-            self.click_element(input_field)
-            self.page.wait_for_timeout(300)
-        else:
-            self._emit("Поле ввода не найдено, пробую кликнуть по центру панели поиска...")
-            # Кликаем в верхнюю центральную часть экрана где должно быть поле ввода
-            bounds = self.get_canvas_bounds()
-            if bounds:
-                cx, cy, cw, ch = bounds
-                # Поле ввода обычно в верхней части по центру
-                click_x = cx + cw // 2
-                click_y = cy + int(ch * 0.15)  # 15% от верха
-                self.page.mouse.click(click_x, click_y)
-                self.page.wait_for_timeout(300)
         
         # Очистить поле
         try:
@@ -884,7 +634,7 @@ class CanvasNavigator:
         except Exception:
             pass
         
-        # Ввести код
+        # Ввести код (клавиатура ТОЛЬКО для текстового ввода)
         self._emit(f"Ввожу текст: {code}")
         self.type_text(code, delay=30)
         self.page.wait_for_timeout(200)
@@ -893,15 +643,17 @@ class CanvasNavigator:
     
     def submit_search(self) -> bool:
         """
-        Отправить поисковый запрос.
+        Отправить поисковый запрос (геймпад A).
         
         Returns:
             True если поиск выполнен
         """
-        self._emit("Отправляю поиск")
+        self._emit("Отправляю поиск (A)")
         
         try:
-            self.page.keyboard.press('Enter')
+            if self._gamepad:
+                from .gamepad import XboxButton
+                self._gamepad.press_button(XboxButton.A)
             self.page.wait_for_timeout(1500)
             
             # Ждём появления результатов
@@ -912,43 +664,23 @@ class CanvasNavigator:
     
     def select_island(self) -> bool:
         """
-        Выбрать найденный остров.
+        Выбрать найденный остров (геймпад A).
         
         Returns:
             True если остров выбран
         """
-        self._emit("Выбираю остров")
-        
-        snapshot = self.detect_screen_state()
-        
-        # Ищем кнопку SELECT
-        select_btn = snapshot.get_element('select_button')
-        if select_btn:
-            return self.click_element(select_btn)
-        
-        # Fallback: Enter
-        self.press_button(GamepadButton.A)
-        return self.wait_for_screen_change(timeout=3000)
+        self._emit("Выбираю остров (A)")
+        return self.confirm()
     
     def click_play(self) -> bool:
         """
-        Нажать кнопку PLAY.
+        Нажать кнопку PLAY (геймпад A).
         
         Returns:
             True если Play нажата
         """
-        self._emit("Нажимаю PLAY")
-        
-        snapshot = self.detect_screen_state()
-        
-        # Ищем кнопку PLAY
-        play_btn = snapshot.get_element('play_button') or snapshot.get_element('play_button_alt')
-        if play_btn:
-            return self.click_element(play_btn)
-        
-        # Fallback: Enter
-        self.press_button(GamepadButton.A)
-        return self.wait_for_screen_change(timeout=5000)
+        self._emit("Нажимаю PLAY (A)")
+        return self.confirm()
     
     def search_and_launch_island(self, code: str) -> bool:
         """
@@ -1001,615 +733,124 @@ class CanvasNavigator:
     
     def search_and_launch_island_gamepad(self, code: str) -> bool:
         """
-        Альтернативный метод запуска острова ТОЛЬКО через геймпад.
-        
-        Не использует поиск элементов на экране - только D-pad навигацию
-        и кнопки A/B. Более надёжно для Xbox Cloud Gaming.
-        
-        Args:
-            code: Код острова
-            
-        Returns:
-            True если остров запущен
+        Запуск острова через геймпад с автономной vision-навигацией.
+        Делегирует в smart_launch_island_gamepad.
         """
-        self._emit(f"Запуск острова через геймпад: {code}")
-        
-        # 1. Убедиться в фокусе
-        if not self.ensure_focus():
-            self._emit("Не удалось установить фокус")
-            return False
-        
-        self.page.wait_for_timeout(500)
-        
-        # 2. Навигация к поиску через D-pad
-        # В лобби Fortnite: вверх несколько раз -> влево к иконке поиска
-        self._emit("Навигация к поиску через D-pad...")
-        
-        # Сначала убедимся что мы в основном меню лобби (нажмём B пару раз)
-        for _ in range(2):
-            self.cancel()
-            self.page.wait_for_timeout(300)
-        
-        # D-pad вверх чтобы попасть в верхнее меню
-        self.navigate(NavigationDirection.UP, times=5)
-        self.page.wait_for_timeout(300)
-        
-        # D-pad влево к иконке поиска (она обычно слева)
-        self.navigate(NavigationDirection.LEFT, times=3)
-        self.page.wait_for_timeout(300)
-        
-        # Подтверждаем (открываем поиск)
-        self.confirm()
-        self.page.wait_for_timeout(1000)
-        
-        # 3. Ввод кода острова
-        self._emit(f"Ввожу код: {code}")
-        
-        # Фокус уже должен быть в поле ввода
-        # Очищаем и вводим код
-        try:
-            self.page.keyboard.press('Control+a')
-            self.page.wait_for_timeout(50)
-            self.page.keyboard.press('Delete')
-            self.page.wait_for_timeout(50)
-        except Exception:
-            pass
-        
-        self.type_text(code, delay=50)
-        self.page.wait_for_timeout(500)
-        
-        # 4. Подтверждаем поиск (Enter)
-        self._emit("Отправляю поиск...")
-        self.page.keyboard.press('Enter')
-        self.page.wait_for_timeout(2000)
-        
-        # 5. Выбираем первый результат
-        self._emit("Выбираю остров...")
-        self.confirm()  # A для выбора
-        self.page.wait_for_timeout(1500)
-        
-        # 6. Нажимаем PLAY
-        self._emit("Нажимаю PLAY...")
-        
-        # Может потребоваться навигация к кнопке PLAY
-        self.navigate(NavigationDirection.DOWN, times=2)
-        self.page.wait_for_timeout(200)
-        
-        self.confirm()  # A для запуска
-        self.page.wait_for_timeout(1000)
-        
-        self._emit("Остров запущен через геймпад!")
-        return True
+        return self.smart_launch_island_gamepad(code)
     
     def search_and_launch_island_xbox(self, code: str) -> bool:
         """
-        Метод запуска острова для Xbox Cloud Gaming.
-        
-        Паттерн для лобби Fortnite:
-        1. Находимся в лобби Fortnite (видим персонажа)
-        2. Скролл вниз - появляется экран Discover с полем поиска "Search Discover"
-        3. Клик по полю поиска "Search Discover" (вверху экрана Discover)
-        4. Появляется диалог с полем ввода
-        5. Ввести код острова
-        6. Нажать Enter/ODESLAT для поиска
-        7. Выбрать первую карту в результатах
-        8. Нажать SELECT
-        9. Нажать PLAY
-        
-        Args:
-            code: Код острова
-            
-        Returns:
-            True если остров запущен
+        Запуск острова через Xbox метод с автономной vision-навигацией.
+        Делегирует в smart_launch_island_gamepad.
         """
-        self._emit(f"Запуск острова через Xbox метод: {code}")
-        self._log_input("START", f"Запуск острова {code}", "Xbox Cloud Gaming метод")
-        
-        # 1. Убедиться в фокусе
-        if not self.ensure_focus():
-            self._emit("Не удалось установить фокус")
-            return False
-        
-        self._log_input("WAIT", "500ms", "после фокуса")
-        self.page.wait_for_timeout(500)
-        
-        bounds = self.get_canvas_bounds()
-        if not bounds:
-            self._emit("Не удалось получить размеры канваса")
-            return False
-        
-        cx, cy, cw, ch = bounds
-        self._log_input("INFO", f"Canvas bounds: ({cx}, {cy}) {cw}x{ch}", "")
-        
-        # 2. Скролл вниз чтобы перейти из лобби с персонажем в экран Discover
-        # Используем геймпад D-pad DOWN для скролла (работает в Xbox Cloud Gaming)
-        # ВАЖНО: достаточно 1-2 нажатий чтобы попасть на Discover, 5 - слишком много!
-        self._emit("Скролл вниз к экрану Discover (геймпад)...")
-        
-        scroll_count = 2  # Достаточно 2 нажатий чтобы попасть на Discover
-        
-        if self._gamepad and self._gamepad.is_virtual:
-            # Скролл через виртуальный геймпад - D-pad вниз
-            for i in range(scroll_count):
-                self._log_input("GAMEPAD", "D-PAD DOWN", f"скролл {i+1}/{scroll_count}")
-                self._gamepad.navigate_down(times=1, delay_ms=150)
-                self._emit(f"D-pad DOWN {i+1}/{scroll_count}...")
-                self.page.wait_for_timeout(500)
-        else:
-            # Fallback: пробуем клавиатуру
-            self._emit("Геймпад недоступен, пробую клавиатуру...")
-            for i in range(scroll_count):
-                self._log_input("KEY", "ArrowDown", f"скролл {i+1}/{scroll_count}")
-                self.page.keyboard.press('ArrowDown')
-                self._emit(f"ArrowDown {i+1}/{scroll_count}...")
-                self.page.wait_for_timeout(500)
-        
-        # Ждём анимацию перехода к экрану Discover
-        self._log_input("WAIT", "1000ms", "ожидание анимации Discover")
-        self.page.wait_for_timeout(1000)
-        
-        # 3. Клик по полю поиска "Search Discover"
-        # После скролла вниз поле поиска находится ВВЕРХУ СЛЕВА экрана Discover
-        # На скриншоте: [LT] 🔍 Search Discover - это кнопка/поле слева вверху
-        # Координаты: x ~5-25% ширины, y ~7% от верха
-        self._emit("Ищу и кликаю по полю поиска Search Discover (вверху слева)...")
-        
-        # Координаты поля поиска - ВВЕРХУ СЛЕВА экрана после скролла
-        # Поле с иконкой LT и лупой занимает примерно x: 5%-25%, y: 6-9%
-        search_positions = [
-            (0.15, 0.07),  # Центр поисковой строки (Search Discover)
-            (0.12, 0.07),  # Левее - ближе к иконке лупы
-            (0.20, 0.07),  # Правее
-            (0.15, 0.08),  # Чуть ниже
-            (0.10, 0.07),  # Ещё левее (ближе к LT)
-        ]
-        
-        search_clicked = False
-        for idx, (rel_x, rel_y) in enumerate(search_positions):
-            try:
-                search_x = cx + int(cw * rel_x)
-                search_y = cy + int(ch * rel_y)
-                
-                self._log_input("CLICK", f"({search_x}, {search_y})", f"поиск Search Discover, попытка {idx+1}/{len(search_positions)}, rel=({rel_x:.0%}, {rel_y:.0%})")
-                self._emit(f"Пробую клик по поиску вверху ({search_x}, {search_y})")
-                self.page.mouse.click(search_x, search_y)
-                self.page.wait_for_timeout(1500)
-                
-                # После клика по полю поиска должен появиться диалог ввода
-                search_clicked = True
-                break
-            except Exception as e:
-                self._emit(f"Ошибка клика: {e}")
-        
-        if not search_clicked:
-            # Последняя попытка - клик точно по центру верхней левой части
-            self._emit("Финальная попытка клика по полю поиска...")
-            try:
-                search_x = cx + int(cw * 0.15)  # ~15% от левого края (центр Search Discover)
-                search_y = cy + int(ch * 0.07)  # ~7% от верха
-                self._log_input("CLICK", f"({search_x}, {search_y})", "финальная попытка Search Discover")
-                self.page.mouse.click(search_x, search_y)
-            except Exception:
-                pass
-            self.page.wait_for_timeout(1500)
-        
-        # 4. Ждём появление диалога с полем ввода
-        self._emit("Ожидаю диалог ввода кода...")
-        self._log_input("WAIT", "1000ms", "ожидание диалога ввода")
-        self.page.wait_for_timeout(1000)
-        
-        # 5. Ввести код острова
-        self._emit(f"Ввожу код острова: {code}")
-        
-        try:
-            # Очищаем поле на всякий случай
-            self._log_input("KEY", "Ctrl+A", "выделить всё в поле ввода")
-            self.page.keyboard.press('Control+a')
-            self.page.wait_for_timeout(50)
-            
-            self._log_input("TYPE", f'"{code}"', f"ввод кода острова, {len(code)} символов")
-            self.page.keyboard.type(code, delay=50)
-            self.page.wait_for_timeout(500)
-        except Exception as e:
-            self._emit(f"Ошибка ввода: {e}")
-        
-        # 6. Нажать Enter/ODESLAT для поиска
-        self._emit("Отправляю поиск...")
-        
-        # Пробуем найти кнопку через DOM
-        odeslat_clicked = False
-        try:
-            btn = self.page.locator('button:has-text("ODESLAT"), button:has-text("Odeslat"), button:has-text("Send"), button:has-text("Submit"), button:has-text("Search")').first
-            if btn and btn.is_visible(timeout=2000):
-                self._log_input("CLICK", "DOM button ODESLAT/Send", "найдена кнопка отправки")
-                btn.click()
-                odeslat_clicked = True
-                self._emit("Кнопка отправки найдена и нажата")
-        except Exception:
-            pass
-        
-        if not odeslat_clicked:
-            self._log_input("KEY", "Enter", "отправка поиска")
-            self._emit("Нажимаю Enter для поиска")
-            self.page.keyboard.press('Enter')
-        
-        self._log_input("WAIT", "2500ms", "ожидание результатов поиска")
-        self.page.wait_for_timeout(2500)
-        
-        # 7. Выбрать первую карту в результатах
-        self._emit("Выбираю первую карту в результатах...")
-        
-        # Карта обычно появляется слева-по центру
-        card_positions = [
-            (0.25, 0.50),  # Левая часть, центр
-            (0.30, 0.45),  # Чуть правее и выше
-            (0.20, 0.55),  # Левее и ниже
-        ]
-        
-        for idx, (rel_x, rel_y) in enumerate(card_positions):
-            try:
-                card_x = cx + int(cw * rel_x)
-                card_y = cy + int(ch * rel_y)
-                
-                self._log_input("CLICK", f"({card_x}, {card_y})", f"выбор карты острова, rel=({rel_x:.0%}, {rel_y:.0%})")
-                self._emit(f"Кликаю по карте ({card_x}, {card_y})")
-                self.page.mouse.click(card_x, card_y)
-                self.page.wait_for_timeout(1500)
-                break
-            except Exception as e:
-                self._emit(f"Ошибка клика по карте: {e}")
-        
-        # 8. Нажать SELECT
-        self._emit("Ищу и нажимаю кнопку SELECT...")
-        
-        # Пробуем найти кнопку через DOM
-        select_clicked = False
-        try:
-            btn = self.page.locator('button:has-text("SELECT"), button:has-text("Select"), button:has-text("VYBRAT"), button:has-text("Vybrat")').first
-            if btn and btn.is_visible(timeout=2000):
-                self._log_input("CLICK", "DOM button SELECT", "найдена кнопка выбора")
-                btn.click()
-                select_clicked = True
-                self._emit("Кнопка SELECT найдена и нажата")
-        except Exception:
-            pass
-        
-        if not select_clicked:
-            # Fallback: координаты внизу экрана
-            select_x = cx + int(cw * 0.50)  # Центр
-            select_y = cy + int(ch * 0.85)  # Низ экрана
-            self._log_input("CLICK", f"({select_x}, {select_y})", "SELECT fallback, низ экрана")
-            self._emit(f"Кликаю по координатам SELECT ({select_x}, {select_y})")
-            self.page.mouse.click(select_x, select_y)
-        
-        self._log_input("WAIT", "2000ms", "после SELECT")
-        self.page.wait_for_timeout(2000)
-        
-        # 9. Нажать PLAY
-        self._emit("Ищу и нажимаю кнопку PLAY...")
-        
-        play_clicked = False
-        try:
-            btn = self.page.locator('button:has-text("PLAY"), button:has-text("Play"), button:has-text("HRÁT"), button:has-text("Hrát")').first
-            if btn and btn.is_visible(timeout=2000):
-                self._log_input("CLICK", "DOM button PLAY", "найдена кнопка запуска")
-                btn.click()
-                play_clicked = True
-                self._emit("Кнопка PLAY найдена и нажата")
-        except Exception:
-            pass
-        
-        if not play_clicked:
-            # Fallback: та же позиция что SELECT (кнопки меняются)
-            play_x = cx + int(cw * 0.50)
-            play_y = cy + int(ch * 0.85)
-            self._log_input("CLICK", f"({play_x}, {play_y})", "PLAY fallback, низ экрана")
-            self._emit(f"Кликаю по координатам PLAY ({play_x}, {play_y})")
-            self.page.mouse.click(play_x, play_y)
-        
-        self._log_input("WAIT", "1500ms", "после PLAY")
-        self.page.wait_for_timeout(1500)
-        
-        self._log_input("DONE", f"Остров {code} запущен", "Xbox метод успешен")
-        self._emit("Остров запущен через Xbox метод!")
-        return True
+        return self.smart_launch_island_gamepad(code)
     
     def smart_launch_island_gamepad(self, code: str, max_attempts: int = 40) -> bool:
         """
-        🎮 УМНАЯ навигация к острову через ГЕЙМПАД на основе Vision.
+        Навигация к острову через геймпад.
         
-        Полный флоу:
-        1. LOBBY (персонаж) → D-PAD DOWN (скролл к Discover)
-        2. DISCOVER (Search bar) → навигация + A (открыть диалог)
-        3. SEARCH_INPUT (диалог) → ввод кода + ODESLAT
-        4. SEARCH_RESULTS (карточка) → навигация + A (выбрать)
-        5. ISLAND_PREVIEW (превью) → проверить лайк → SELECT
-        6. LOBBY (остров выбран) → PLAY
-        
-        Args:
-            code: Код острова (например 9620-3395-1945)
-            max_attempts: Максимум попыток
-            
-        Returns:
-            True если остров запущен
+        Vision-модуль удалён. Используйте search_and_launch_island() 
+        або хардкод-послідовність (fallback).
         """
-        from ..vision.state import detect_screen_state, ScreenState as VisionState
-        from ..vision.capture import capture_page_bgr
-        
-        self._emit(f"🎮 Запуск острова через геймпад: {code}")
-        self._log_input("START", f"GAMEPAD запуск острова {code}", "Vision + Gamepad навигация")
-        
-        # Проверяем геймпад
-        if not self._gamepad or not self._gamepad.is_virtual:
-            self._emit("❌ Виртуальный геймпад недоступен!")
-            return False
-        
-        # Убедиться в фокусе
-        if not self.ensure_focus():
-            self._emit("Не удалось установить фокус")
-            return False
-        
-        bounds = self.get_canvas_bounds()
-        if not bounds:
-            self._emit("Не удалось получить размеры канваса")
-            return False
-        
-        # Состояние машины состояний
-        scrolled_to_discover = False
-        search_bar_clicked = False
-        code_entered = False
-        card_selected = False
-        like_checked = False
-        select_pressed = False
-        returned_to_lobby = False
-        
-        for attempt in range(max_attempts):
-            # Получаем текущее состояние экрана
-            try:
-                img = capture_page_bgr(self.page)
-                state = detect_screen_state(img, use_cache=False)
-            except Exception as e:
-                self._emit(f"Ошибка захвата экрана: {e}")
-                self.page.wait_for_timeout(1000)
-                continue
-            
-            state_name = state.name if hasattr(state, 'name') else str(state)
-            self._emit(f"👁️ [{attempt+1}/{max_attempts}] Вижу: {state_name}")
-            self._log_input("VISION", state_name, f"попытка {attempt+1}")
-            
-            # ===== ШАГ 1: LOBBY → скролл к Discover =====
-            if state == VisionState.LOBBY and not select_pressed:
-                # Если ещё не нажали SELECT - значит мы в начале, скроллим к Discover
-                if not scrolled_to_discover:
-                    self._emit("📍 [1/6] Лобби → D-PAD DOWN к Discover")
-                    self._gamepad_scroll_down()
-                    scrolled_to_discover = True
-                    self.page.wait_for_timeout(1000)
-                    continue
-                else:
-                    # Уже скроллили, но всё ещё видим LOBBY - пробуем ещё раз
-                    self._emit("📍 Всё ещё в лобби → ещё D-PAD DOWN")
-                    self._gamepad_scroll_down()
-                    self.page.wait_for_timeout(800)
-                    continue
-            
-            # ===== ШАГ 2: DISCOVER → открыть Search диалог =====
-            elif state == VisionState.DISCOVER and not search_bar_clicked:
-                self._emit("📍 [2/6] Discover → открываю Search диалог")
-                # На DISCOVER экране Search bar уже видим слева вверху
-                # Нужно просто нажать D-PAD DOWN чтобы фокус попал на Search bar
-                # Потом нажать A (или LT) для открытия диалога ввода
-                
-                # Один D-PAD DOWN чтобы выбрать Search bar
-                self._emit("  → D-PAD DOWN (выбор Search bar)")
-                self._gamepad.navigate_down(times=1, delay_ms=200)
-                self.page.wait_for_timeout(500)
-                
-                # Нажимаем A для открытия диалога ввода
-                self._emit("  → A (открыть диалог ввода)")
-                self._gamepad.confirm()
-                search_bar_clicked = True
-                self.page.wait_for_timeout(1500)
-                continue
-            
-            # ===== ШАГ 3: SEARCH_INPUT → ввод кода =====
-            elif state == VisionState.SEARCH_INPUT and not code_entered:
-                self._emit(f"📍 [3/6] Диалог ввода → ввожу код {code}")
-                # Ввод кода через клавиатуру (это единственное что через клаву)
-                self.page.keyboard.type(code, delay=50)
-                self.page.wait_for_timeout(500)
-                
-                # Навигация к кнопке ODESLAT и нажатие
-                self._gamepad.navigate_down(times=1, delay_ms=200)
-                self.page.wait_for_timeout(200)
-                self._gamepad.confirm()  # Нажимаем A на ODESLAT
-                
-                code_entered = True
-                self.page.wait_for_timeout(2500)
-                continue
-            
-            # ===== ШАГ 4: SEARCH_RESULTS → выбрать карточку =====
-            elif state == VisionState.SEARCH_RESULTS and not card_selected:
-                self._emit("📍 [4/6] Результаты → выбираю карточку острова")
-                # Карточка обычно уже выделена или нужно нажать вниз
-                self._gamepad.navigate_down(times=2, delay_ms=300)
-                self.page.wait_for_timeout(300)
-                self._gamepad.confirm()  # A для выбора карточки
-                card_selected = True
-                self.page.wait_for_timeout(2000)
-                continue
-            
-            # ===== ШАГ 5: ISLAND_PREVIEW → лайк + SELECT =====
-            elif state == VisionState.ISLAND_PREVIEW:
-                if not like_checked:
-                    self._emit("📍 [5/6] Превью → проверяю лайк")
-                    # Проверяем и ставим лайк если нужно
-                    self._check_and_like_island(img)
-                    like_checked = True
-                    self.page.wait_for_timeout(500)
-                
-                if not select_pressed:
-                    self._emit("📍 [5/6] Превью → нажимаю SELECT")
-                    # SELECT обычно выделен по умолчанию
-                    self._gamepad.confirm()  # A для SELECT
-                    select_pressed = True
-                    self.page.wait_for_timeout(2000)
-                    continue
-            
-            # ===== ШАГ 6: Вернулись в LOBBY после SELECT → нажать PLAY =====
-            elif state == VisionState.LOBBY and select_pressed:
-                if not returned_to_lobby:
-                    self._emit("📍 [6/6] Лобби (остров выбран) → нажимаю PLAY!")
-                    # PLAY кнопка - навигация влево-вниз и A
-                    self._gamepad.navigate_left(times=2, delay_ms=200)
-                    self.page.wait_for_timeout(200)
-                    self._gamepad.navigate_down(times=1, delay_ms=200)
-                    self.page.wait_for_timeout(200)
-                    self._gamepad.confirm()  # A для PLAY
-                    returned_to_lobby = True
-                    self.page.wait_for_timeout(3000)
-                    continue
-                else:
-                    # Уже нажали PLAY, ждём загрузки
-                    self._emit("📍 PLAY нажат, жду загрузку...")
-                    self.page.wait_for_timeout(2000)
-                    continue
-            
-            # ===== УСПЕХ: Загрузка или в игре =====
-            elif state in [VisionState.LOADING, VisionState.IN_GAME]:
-                self._emit("✅ Остров запускается!")
-                self._log_input("DONE", f"Остров {code} запущен", "GAMEPAD навигация успешна")
-                return True
-            
-            # ===== TITLE_SCREEN → нажать для продолжения =====
-            elif state == VisionState.TITLE_SCREEN:
-                self._emit("📍 Титульный экран → A для продолжения")
-                self._gamepad.confirm()
-                self.page.wait_for_timeout(2000)
-                continue
-            
-            # ===== MENU → закрыть =====
-            elif state == VisionState.MENU:
-                self._emit("📍 Меню → B для закрытия")
-                self._gamepad.cancel()
-                self.page.wait_for_timeout(500)
-                continue
-            
-            # ===== UNKNOWN → ждём =====
-            else:
-                self._emit(f"❓ Состояние: {state_name}, жду...")
-                self.page.wait_for_timeout(1500)
-                continue
-        
-        self._emit(f"❌ Не удалось запустить остров за {max_attempts} попыток")
+        self._emit("⚠️ smart_launch_island_gamepad: vision удалён, используйте fallback")
+        logger.warning("smart_launch_island_gamepad called but vision module removed")
         return False
     
-    def _gamepad_scroll_down(self):
-        """Скролл вниз через геймпад D-PAD."""
-        self._log_input("GAMEPAD", "D-PAD DOWN", "скролл к Discover")
-        self._gamepad.navigate_down(times=1, delay_ms=150)
-    
-    def _check_and_like_island(self, img):
-        """Проверяет лайкнут ли остров и ставит лайк если нет."""
-        from ..vision.template_nav import is_island_liked, find_like_button_empty
-        
-        # Проверяем статус лайка
-        if is_island_liked(img):
-            self._emit("💜 Остров уже лайкнут")
-            return
-        
-        # Остров НЕ лайкнут - ставим лайк
-        self._emit("❤️ Остров НЕ лайкнут → ставлю лайк")
-        self._log_input("GAMEPAD", "Navigate to Like + A", "ставлю лайк")
-        
-        # Навигация к лайку (обычно справа от SELECT)
-        # На Xbox лайк часто на Y или нужно навигировать вправо
-        self._gamepad.navigate_right(times=2, delay_ms=200)
-        self.page.wait_for_timeout(200)
-        self._gamepad.confirm()  # A для лайка
-        self.page.wait_for_timeout(500)
-        
-        # Вернуться к SELECT (влево)
-        self._gamepad.navigate_left(times=2, delay_ms=200)
+    def _get_xbox_button(self, name: str):
+        """Получить XboxButton по имени."""
+        from .gamepad import XboxButton
+        return getattr(XboxButton, name)
     
     # Старый метод для совместимости
     def smart_launch_island(self, code: str, max_attempts: int = 30) -> bool:
         """Алиас для smart_launch_island_gamepad."""
         return self.smart_launch_island_gamepad(code, max_attempts)
-    
+
     # ========================================================================
-    # MOVEMENT & CAMERA
+    # MOVEMENT & CAMERA (GAMEPAD ONLY)
     # ========================================================================
-    
+
     def move(
         self,
         direction: str,
         duration_ms: int = 500
     ) -> None:
         """
-        Движение персонажа.
+        Движение персонажа через левый стик геймпада.
         
         Args:
             direction: 'forward', 'back', 'left', 'right'
             duration_ms: Время удержания
         """
-        key_map = {
-            'forward': 'w', 'up': 'w',
-            'back': 's', 'down': 's',
-            'left': 'a',
-            'right': 'd',
+        if not self._gamepad:
+            logger.warning("Gamepad not available for movement")
+            return
+        
+        stick_map = {
+            'forward': (0.0, 1.0),
+            'up': (0.0, 1.0),
+            'back': (0.0, -1.0),
+            'down': (0.0, -1.0),
+            'left': (-1.0, 0.0),
+            'right': (1.0, 0.0),
         }
         
-        key = key_map.get(direction.lower(), 'w')
+        x, y = stick_map.get(direction.lower(), (0.0, 1.0))
         
         try:
-            self.page.keyboard.down(key)
+            self._gamepad.set_left_stick(x, y)
             self.page.wait_for_timeout(duration_ms)
-            self.page.keyboard.up(key)
+            self._gamepad.set_left_stick(0.0, 0.0)
             self._log_action(f"move({direction}, {duration_ms})")
         except Exception as e:
             logger.error(f"Move failed: {e}")
     
     def look(self, dx: int = 0, dy: int = 0) -> None:
         """
-        Поворот камеры мышью.
+        Поворот камеры через правый стик геймпада.
         
         Args:
-            dx: Смещение по X
-            dy: Смещение по Y
+            dx: Смещение по X (-100..100 -> -1.0..1.0)
+            dy: Смещение по Y (-100..100 -> -1.0..1.0)
         """
-        bounds = self.get_canvas_bounds()
-        if not bounds:
+        if not self._gamepad:
             return
         
-        cx = bounds[0] + bounds[2] // 2
-        cy = bounds[1] + bounds[3] // 2
-        
         try:
-            self.page.mouse.move(cx, cy)
-            self.page.mouse.down()
-            self.page.mouse.move(cx + dx, cy + dy, steps=5)
-            self.page.mouse.up()
+            # Нормализуем dx/dy из пиксельных значений в -1.0..1.0
+            fx = max(-1.0, min(1.0, dx / 100.0))
+            fy = max(-1.0, min(1.0, dy / 100.0))
+            
+            self._gamepad.set_right_stick(fx, fy)
+            self.page.wait_for_timeout(200)
+            self._gamepad.set_right_stick(0.0, 0.0)
             self._log_action(f"look({dx}, {dy})")
         except Exception as e:
             logger.error(f"Look failed: {e}")
     
     def jump(self) -> None:
-        """Прыжок."""
-        self.page.keyboard.press('Space')
-        self._log_action("jump")
+        """Прыжок (геймпад A)."""
+        if self._gamepad:
+            from .gamepad import XboxButton
+            self._gamepad.press_button(XboxButton.A)
+            self._log_action("jump")
     
     def interact(self) -> None:
-        """Взаимодействие (E)."""
-        self.page.keyboard.press('e')
-        self._log_action("interact")
+        """Взаимодействие (геймпад X)."""
+        if self._gamepad:
+            from .gamepad import XboxButton
+            self._gamepad.press_button(XboxButton.X)
+            self._log_action("interact")
     
     # ========================================================================
     # AFK PREVENTION
     # ========================================================================
     
     def do_random_action(self) -> None:
-        """Выполнить случайное действие для AFK-защиты."""
+        """Выполнить случайное действие для AFK-защиты через геймпад."""
+        if not self._gamepad:
+            return
+        
         actions = [
             lambda: self.move('forward', 200),
             lambda: self.move('back', 200),

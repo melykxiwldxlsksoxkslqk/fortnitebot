@@ -1,15 +1,13 @@
 """
-EpicBot - Cloud Gaming Automation Bot.
+EpicBot — Fortnite XP Farm через LDPlayer + Xbox Cloud Gaming.
 
-Микросервисная архитектура:
-    - core: Базовые компоненты (config, logger, db, security, exceptions)
-    - vision: Компьютерное зрение (detection, state, capture, templates, yolo)
-    - browser: Браузерная автоматизация (manager, input)
-    - bot: Логика бота (logic, runner)
-    - ipc: IPC сервер для Electron (server)
+Архітектура:
+    - core: Базові компоненти (config, logger, db, security, exceptions)
+    - emulator: Автоматизація LDPlayer (ldplayer, vpn, macros, accounts, session)
+    - ipc: JSON-RPC сервер для Desktop GUI (Electron/React)
 """
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 __author__ = "EpicBot Team"
 
 # === Core модуль ===
@@ -21,10 +19,7 @@ from .core import (
     # Конфигурация
     ROOT_DIR,
     TIMEOUTS,
-    VISION,
-    RL,
-    BROWSER,
-    ASSETS,
+    EMULATOR,
     DEFAULT_SETTINGS,
     # База данных
     init_db,
@@ -38,120 +33,100 @@ from .core import (
     # Исключения
     EpicBotError,
     BadCredentialsError,
-    BrowserClosedError,
-    TemplateNotFoundError,
     NavigationError,
 )
 
-# === Vision модуль ===
-from .vision import (
-    # Состояния экрана
-    ScreenState,
-    detect_screen_state,
-    wait_for_screen_state,
-    # Детекция
-    find_template,
-    find_template_multi,
-    wait_for_template,
-    detect_button,
-    smart_find_element,
-    # Захват
-    capture_screen,
-    capture_page_bgr,
-    # Шаблоны
-    load_template,
-    # YOLO
-    yolo_load_model,
-    yolo_detect,
-)
-
-# === Browser модуль ===
-from .browser import (
-    BrowserManager,
-    create_browser,
-    # Ввод
-    press_key,
-    press_action,
-    click_at,
-    type_text,
-    click_canvas,
-    focus_canvas,
-)
-
-# === Bot модуль ===
-from .bot import (
-    BotLogic,
-    BotRunner,
-    run_bot,
+# === Emulator модуль ===
+from .emulator import (
+    # Конфігурація
+    EmulatorConfig,
+    InstanceConfig,
+    VPNConfig,
+    MacroConfig,
+    SessionConfig,
+    # LDPlayer
+    LDPlayerManager,
+    EmulatorInstance,
+    InstanceStatus,
+    # VPN
+    VPNManager,
+    VPNStatus,
+    VPNRegion,
+    # APK
+    APKManager,
+    APKInfo,
+    APKType,
+    # Акаунти
+    EmulatorAccountManager,
+    AccountData,
+    AccountType,
+    # Макроси
+    MacroPlayer,
+    MacroComposer,
+    MacroFactory,
+    MacroSequence,
+    MacroStep,
+    MacroAction,
+    # Сесія
+    SessionOrchestrator,
+    GameSession,
+    SessionState,
 )
 
 # === IPC модуль ===
 from .ipc import (
-    main as ipc_main,
+    IPCServer,
     handle_command,
 )
 
 __all__ = [
-    # Core - Логирование
+    # Core
     "get_logger",
     "setup_logging",
     "LogContext",
-    # Core - Конфигурация
     "ROOT_DIR",
     "TIMEOUTS",
-    "VISION",
-    "RL",
-    "BROWSER",
-    "ASSETS",
+    "EMULATOR",
     "DEFAULT_SETTINGS",
-    # Core - База данных
     "init_db",
     "fetch_accounts",
     "fetch_proxies",
     "get_settings",
     "set_settings",
-    # Core - Безопасность
     "encrypt_password",
     "decrypt_password",
-    # Core - Исключения
     "EpicBotError",
     "BadCredentialsError",
-    "BrowserClosedError",
-    "TemplateNotFoundError",
     "NavigationError",
-    # Vision - Состояния
-    "ScreenState",
-    "detect_screen_state",
-    "wait_for_screen_state",
-    # Vision - Детекция
-    "find_template",
-    "find_template_multi",
-    "wait_for_template",
-    "detect_button",
-    "smart_find_element",
-    # Vision - Захват
-    "capture_screen",
-    "capture_page_bgr",
-    # Vision - Шаблоны
-    "load_template",
-    # Vision - YOLO
-    "yolo_load_model",
-    "yolo_detect",
-    # Browser
-    "BrowserManager",
-    "create_browser",
-    "press_key",
-    "press_action",
-    "click_at",
-    "type_text",
-    "click_canvas",
-    "focus_canvas",
-    # Bot
-    "BotLogic",
-    "BotRunner",
-    "run_bot",
+    # Emulator
+    "EmulatorConfig",
+    "InstanceConfig",
+    "VPNConfig",
+    "MacroConfig",
+    "SessionConfig",
+    "LDPlayerManager",
+    "EmulatorInstance",
+    "InstanceStatus",
+    "VPNManager",
+    "VPNStatus",
+    "VPNRegion",
+    "APKManager",
+    "APKInfo",
+    "APKType",
+    "EmulatorAccountManager",
+    "AccountData",
+    "AccountType",
+    "MacroPlayer",
+    "MacroComposer",
+    "MacroFactory",
+    "MacroSequence",
+    "MacroStep",
+    "MacroAction",
+    "SessionOrchestrator",
+    "GameSession",
+    "SessionState",
     # IPC
-    "ipc_main",
+    "IPCServer",
     "handle_command",
     # Версия
     "__version__",

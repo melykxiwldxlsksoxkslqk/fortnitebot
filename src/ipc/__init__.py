@@ -1,13 +1,14 @@
 """
-IPC модуль - межпроцессное взаимодействие.
+IPC модуль — JSON-RPC сервер для Desktop GUI.
 
-Содержит:
-- server: JSON-RPC сервер для общения с Electron
+Забезпечує зв'язок між Electron (React UI) та Python (SessionOrchestrator).
+Протокол: JSON-RPC 2.0 через stdin/stdout.
 """
 
-from .server import main, handle_command
+from .server import IPCServer, main, handle_command
 
 __all__ = [
+    'IPCServer',
     'main',
     'handle_command',
 ]

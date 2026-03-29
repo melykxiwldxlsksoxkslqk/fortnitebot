@@ -20,16 +20,6 @@ class CodeRequiredError(EpicBotError):
     pass
 
 
-class BrowserClosedError(EpicBotError):
-    """Браузер/страница были закрыты пользователем во время сеанса."""
-    pass
-
-
-class VisionError(EpicBotError):
-    """Ошибка в модуле компьютерного зрения."""
-    pass
-
-
 class TimeoutError(EpicBotError):
     """Превышено время ожидания операции."""
     pass
@@ -45,18 +35,8 @@ class GameLaunchError(EpicBotError):
     pass
 
 
-class IslandNavigationError(EpicBotError):
-    """Ошибка при навигации к острову."""
-    pass
-
-
 class NavigationError(EpicBotError):
     """Общая ошибка навигации."""
-    pass
-
-
-class TemplateNotFoundError(VisionError):
-    """Шаблон не найден на экране."""
     pass
 
 

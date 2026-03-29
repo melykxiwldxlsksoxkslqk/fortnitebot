@@ -1,1245 +1,454 @@
 """
-IPC Server - JSON-RPC сервер для общения с Electron.
+JSON-RPC 2.0 IPC сервер для Desktop GUI (Electron/React).
 
-Обрабатывает команды от десктопного приложения.
-Поддерживает:
-- Управление ботами (старт/стоп)
-- Управление аккаунтами и прокси
-- Настройки
-- Canvas навигацию
-- Vision/YOLO детекцию
-- Статистику и метрики
+Протокол:
+    - Зчитує JSON-RPC запити з stdin (по рядку)
+    - Відправляє JSON-RPC відповіді у stdout
+    - Підтримує notifications (events) через stdout
+
+Команди:
+    # Глобальні
+    ping                     → pong
+    get_version              → версія бота
+    get_status               → загальний статус (інстанси, сесії, акаунти)
+
+    # Акаунти
+    get_accounts             → список акаунтів з БД
+    add_account(login, pwd)  → додати акаунт
+    delete_account(login)    → видалити акаунт
+    import_accounts(text)    → масовий імпорт (email:password по рядках)
+
+    # Інстанси LDPlayer
+    list_instances           → список інстансів з їх станом
+    setup_instance(name)     → створити + налаштувати новий інстанс
+    clone_instance(src,dst)  → клонувати інстанс
+    remove_instance(name)    → видалити інстанс
+
+    # Фарм
+    start_farm(name, email)  → запустити фарм на інстансі
+    stop_farm(name)          → зупинити фарм на інстансі
+    stop_all                 → зупинити все
+    shutdown_all             → зупинити все + вимкнути емулятори
+
+    # Налаштування
+    get_settings             → поточні налаштування
+    set_settings(data)       → зберегти налаштування
+    get_emulator_config      → конфігурація емулятора
+    set_emulator_config(d)   → зберегти конфігурацію емулятора
+
+    # Логи
+    get_recent_logs(n)       → останні n рядків логу
 """
 
 import sys
 import json
-import asyncio
 import threading
 import time
-import traceback
-from dataclasses import dataclass, field, asdict
-from enum import Enum
-from typing import Dict, List, Optional, Any, Callable, TYPE_CHECKING
-from datetime import datetime
+import os
+import io
+from typing import Any, Dict, Optional, Callable, List
 
-if TYPE_CHECKING:
-    from ..bot.parallel import BotWorkerPool
+# IPC I/O потоки. При запуску через __main__.py вони будуть перезаписані
+# на клоновані fd до того як setup_logging() зламає sys.stdout.
+# Значення за замовчуванням — для тестів де stdout не зламаний.
+_IPC_STDOUT: io.TextIOWrapper = sys.stdout  # type: ignore[assignment]
+_IPC_STDIN: io.TextIOWrapper = sys.stdin    # type: ignore[assignment]
 
-from ..core import db as dbmod
-from ..core import get_logger
-from ..bot import BotLogic
+from ..core.logger import get_logger, setup_logging
+from ..core.db import (
+    init_db,
+    fetch_accounts,
+    add_account,
+    delete_account,
+    upsert_accounts,
+    get_account_count,
+    fetch_proxies,
+    get_settings,
+    set_settings,
+    get_setting,
+    set_setting,
+)
+from ..core.config import ROOT_DIR, LOGS_DIR
+from ..emulator import (
+    SessionOrchestrator,
+    EmulatorConfig,
+    AccountData,
+    SessionState,
+    EmulatorError,
+)
 
 logger = get_logger(__name__)
 
 
-# === Типы событий ===
-class EventType(str, Enum):
-    """Типы событий для UI."""
-    STATUS = "status"
-    ERROR = "error"
-    METRIC = "metric"
-    BOT_STATE = "bot_state"
-    DETECTION = "detection"
-    SCREEN_STATE = "screen_state"
-    PROGRESS = "progress"
+# ============================================================================
+# JSON-RPC HELPERS
+# ============================================================================
+
+def _ok(result: Any, req_id: Any) -> Dict:
+    """Успішна JSON-RPC відповідь."""
+    return {"jsonrpc": "2.0", "result": result, "id": req_id}
 
 
-# === Статистика бота ===
-@dataclass
-class BotMetrics:
-    """Метрики работы бота."""
-    login: str
-    started_at: Optional[float] = None
-    lobby_reached_at: Optional[float] = None
-    island_launched_at: Optional[float] = None
-    errors_count: int = 0
-    reconnects_count: int = 0
-    afk_actions_count: int = 0
-    detections_count: int = 0
-    last_detection_time: Optional[float] = None
-    current_state: str = "idle"
-    last_error: Optional[str] = None
+def _error(code: int, message: str, req_id: Any = None, data: Any = None) -> Dict:
+    """JSON-RPC помилка."""
+    err: Dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    return {"jsonrpc": "2.0", "error": err, "id": req_id}
+
+
+def _notification(method: str, params: Any = None) -> Dict:
+    """JSON-RPC notification (без id — не потребує відповіді)."""
+    msg: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+    if params is not None:
+        msg["params"] = params
+    return msg
+
+
+# Error codes
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
+APP_ERROR = -32000
+
+
+# ============================================================================
+# IPC SERVER
+# ============================================================================
+
+class IPCServer:
+    """
+    JSON-RPC 2.0 сервер для зв'язку з Electron GUI.
     
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-    
-    def get_uptime(self) -> float:
-        """Время работы в секундах."""
-        if self.started_at:
-            return time.time() - self.started_at
-        return 0.0
-    
-    def get_time_to_lobby(self) -> Optional[float]:
-        """Время до лобби в секундах."""
-        if self.started_at and self.lobby_reached_at:
-            return self.lobby_reached_at - self.started_at
-        return None
+    Lifecycle:
+        server = IPCServer()
+        server.run()  # блокуючий цикл (stdin → process → stdout)
+    """
 
+    def __init__(self) -> None:
+        self._orchestrator: Optional[SessionOrchestrator] = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._event_listeners: List[Callable] = []
 
-# === Глобальное состояние ===
-_BOTS: List[BotLogic] = []
-_THREADS: Dict[str, threading.Thread] = {}
-_SETTINGS: Dict[str, Any] = {}
-_STATUS: Dict[str, Dict[str, Any]] = {}
-_METRICS: Dict[str, BotMetrics] = {}
-_SETTINGS_LOADED = False
-_START_TIME = time.time()
-
-# Кэш для vision операций
-_VISION_CACHE: Dict[str, Any] = {}
-_VISION_CACHE_TTL = 1.0  # секунд
-
-
-# === Утилиты конвертации ===
-def _to_bool(val, default: bool = False) -> bool:
-    """Конвертация значения в bool."""
-    try:
-        if isinstance(val, bool):
-            return val
-        s = str(val).strip().lower()
-        if s in ("1", "true", "yes", "on"):
-            return True
-        if s in ("0", "false", "no", "off", ""):
-            return False
-        return bool(int(val))
-    except Exception:
-        return bool(default)
-
-
-def _to_int(val, default: int = 0) -> int:
-    """Конвертация значения в int."""
-    try:
-        return int(val)
-    except Exception:
-        try:
-            return int(float(val))
-        except Exception:
-            return int(default)
-
-
-def _to_float(val, default: float = 0.0) -> float:
-    """Конвертация значения в float."""
-    try:
-        return float(val)
-    except Exception:
-        return float(default)
-
-
-# === Статус и уведомления ===
-def _send_event(event: str, **data):
-    """Отправка события в stdout для Electron."""
-    try:
-        msg = {"event": event, "timestamp": time.time(), **data}
-        sys.stdout.write(json.dumps(msg) + "\n")
-        sys.stdout.flush()
-    except Exception as e:
-        logger.debug(f"Ошибка отправки события: {e}")
-
-
-def _send_typed_event(event_type: EventType, **data):
-    """Отправка типизированного события."""
-    _send_event(event_type.value, **data)
-
-
-def _update_status(login: str, text: str):
-    """Обновление статуса бота и отправка в UI."""
-    _STATUS[login] = {"status": text, "ts": time.time()}
-    _send_typed_event(EventType.STATUS, login=login, text=text)
-    
-    # Обновление метрик на основе статуса
-    if login in _METRICS:
-        _METRICS[login].current_state = text
-
-
-def _update_metrics(login: str, **updates):
-    """Обновление метрик бота."""
-    if login not in _METRICS:
-        _METRICS[login] = BotMetrics(login=login)
-    
-    for key, value in updates.items():
-        if hasattr(_METRICS[login], key):
-            setattr(_METRICS[login], key, value)
-    
-    _send_typed_event(EventType.METRIC, login=login, metrics=_METRICS[login].to_dict())
-
-
-def _status_sys(login: str, text: str):
-    """Системный статус."""
-    _send_typed_event(EventType.STATUS, login=login or "system", text=text)
-    logger.info(f"[{login or 'system'}] {text}")
-
-
-def _send_error(login: str, error: str, details: Optional[str] = None):
-    """Отправка ошибки в UI."""
-    _send_typed_event(
-        EventType.ERROR, 
-        login=login, 
-        error=error, 
-        details=details,
-        traceback=traceback.format_exc() if details else None
-    )
-    
-    # Обновление метрик
-    if login in _METRICS:
-        _METRICS[login].errors_count += 1
-        _METRICS[login].last_error = error
-
-
-# === Настройки ===
-def _load_settings(force: bool = False):
-    """Загрузка настроек из БД."""
-    global _SETTINGS, _SETTINGS_LOADED
-    if _SETTINGS_LOADED and not force:
-        return
-    
-    try:
-        dbmod.init_db()
-        s = dbmod.get_settings()
-        _SETTINGS = {
-            "island_code": s.get('island_code', ""),
-            "time_on_island_min": _to_int(s.get('time_on_island_min', 15), 15),
-            "headless": _to_bool(s.get('headless', 1), True),
-            "appearance": s.get('appearance', "Dark"),
-            "theme": s.get('theme', "blue"),
-            "ingame_mode": s.get('ingame_mode', "passive"),
-            "invert_bg": _to_bool(s.get('invert_bg', 0), False),
-        }
-        _SETTINGS_LOADED = True
-    except Exception:
-        _SETTINGS = {
-            "island_code": "",
-            "time_on_island_min": 15,
-            "headless": True,
-            "appearance": "Dark",
-            "theme": "blue",
-            "ingame_mode": "passive",
-            "invert_bg": False,
+        # Реєструємо методи
+        self._methods: Dict[str, Callable] = {
+            # Global
+            "ping": self._cmd_ping,
+            "get_version": self._cmd_get_version,
+            "get_status": self._cmd_get_status,
+            # Accounts
+            "get_accounts": self._cmd_get_accounts,
+            "add_account": self._cmd_add_account,
+            "delete_account": self._cmd_delete_account,
+            "import_accounts": self._cmd_import_accounts,
+            # Instances
+            "list_instances": self._cmd_list_instances,
+            "setup_instance": self._cmd_setup_instance,
+            "clone_instance": self._cmd_clone_instance,
+            "remove_instance": self._cmd_remove_instance,
+            # Farm
+            "start_farm": self._cmd_start_farm,
+            "stop_farm": self._cmd_stop_farm,
+            "stop_all": self._cmd_stop_all,
+            "shutdown_all": self._cmd_shutdown_all,
+            # Settings
+            "get_settings": self._cmd_get_settings,
+            "set_settings": self._cmd_set_settings,
+            "get_emulator_config": self._cmd_get_emulator_config,
+            "set_emulator_config": self._cmd_set_emulator_config,
+            # Logs
+            "get_recent_logs": self._cmd_get_recent_logs,
         }
 
+    # ========================================================================
+    # ORCHESTRATOR LIFECYCLE
+    # ========================================================================
 
-# === Команды ===
-def start_all() -> Dict[str, Any]:
-    """Запуск всех ботов."""
-    _load_settings()
-    
-    # Загрузка аккаунтов
-    try:
-        accounts = dbmod.fetch_accounts()
-    except Exception as e:
-        return {"ok": False, "error": f"DB accounts: {e}"}
-    
-    _status_sys("system", f"Запуск ботов: {len(accounts)} аккаунтов")
-    
-    # Загрузка прокси
-    try:
-        proxies = dbmod.fetch_proxies()
-    except Exception:
-        proxies = []
-    
-    if not accounts:
-        return {"ok": False, "error": "Нет аккаунтов"}
-    
-    # Загрузка биндингов прокси
-    bindings = {}
-    try:
-        for b in dbmod.fetch_proxy_bindings():
-            bindings[b['login'].strip().lower()] = f"{b['host']}:{b['port']}"
-    except Exception:
-        pass
-    
-    # Распределение прокси
-    proxies_by_key = {f"{p['host']}:{p['port']}": p for p in proxies}
-    used_keys = set()
-    assignments = {}
-    
-    # Валидация существующих биндингов
-    for login, key in list(bindings.items()):
-        if key in proxies_by_key:
-            used_keys.add(key)
-        else:
-            try:
-                dbmod.delete_proxy_binding_for_login(login)
-            except Exception:
-                pass
-            bindings.pop(login, None)
-    
-    # Назначение прокси аккаунтам
-    for account in accounts:
-        login = (account.get('login') or '').strip().lower()
-        assigned_proxy = None
-        key = bindings.get(login)
-        
-        if key and key in proxies_by_key:
-            assigned_proxy = proxies_by_key[key]
-            used_keys.add(key)
-        else:
-            # Найти свободный прокси
-            free_key = None
-            for k in proxies_by_key.keys():
-                if k not in used_keys:
-                    free_key = k
-                    break
-            
-            if free_key:
-                assigned_proxy = proxies_by_key[free_key]
-                try:
-                    dbmod.upsert_proxy_binding(login, assigned_proxy['host'], assigned_proxy['port'])
-                    bindings[login] = free_key
-                except Exception:
-                    pass
-                used_keys.add(free_key)
-        
-        assignments[login] = assigned_proxy
-    
-    # Запуск ботов
-    for acc in accounts:
-        px = assignments.get((acc.get('login') or '').strip().lower())
-        _start_single_bot(acc, px)
-    
-    return {"ok": True, "started": len(accounts)}
-
-
-def stop_all() -> Dict[str, Any]:
-    """Остановка всех ботов."""
-    _status_sys("system", "Остановка всех ботов...")
-    
-    # Сначала помечаем все боты на остановку
-    for b in list(_BOTS):
-        try:
-            b.request_stop()
-        except Exception:
-            pass
-    
-    # Закрытие браузеров (это быстро прервёт все операции)
-    try:
-        from ..main import close_all_active_browsers
-        close_all_active_browsers()
-    except Exception:
-        pass
-    
-    # Ждём потоки, но не долго (2 секунды максимум на каждый)
-    for login, th in list(_THREADS.items()):
-        try:
-            if th and th.is_alive():
-                th.join(timeout=2)
-        except Exception:
-            pass
-        _THREADS.pop(login, None)
-    
-    # Очищаем список ботов
-    _BOTS.clear()
-    
-    _status_sys("system", "Все боты остановлены")
-    return {"ok": True}
-
-
-def get_status() -> Dict[str, Any]:
-    """Получение текущего статуса."""
-    active = set(_STATUS.keys()) | set(_THREADS.keys())
-    
-    try:
-        accs = dbmod.fetch_accounts()
-    except Exception:
-        accs = []
-    
-    return {
-        "bots": [(b.account or {}).get('login', 'unknown') for b in _BOTS],
-        "threads": list(_THREADS.keys()),
-        "accounts": [],
-        "accounts_all": [a.get('login') for a in accs],
-        "active": list(active),
-        "status": _STATUS,
-        "settings": _SETTINGS,
-    }
-
-
-def get_settings() -> Dict[str, Any]:
-    """Получение настроек."""
-    _load_settings()
-    return _SETTINGS
-
-
-def save_settings(payload: Dict) -> Dict[str, Any]:
-    """Сохранение настроек."""
-    _load_settings()
-    s = _SETTINGS.copy()
-    s.update({
-        'island_code': payload.get('island_code', s['island_code']),
-        'time_on_island_min': _to_int(
-            payload.get('time_on_island_min', s['time_on_island_min'] or 15),
-            s['time_on_island_min'] or 15
-        ),
-        'headless': 1 if _to_bool(payload.get('headless', s['headless'])) else 0,
-        'appearance': payload.get('appearance', s['appearance']),
-        'theme': payload.get('theme', s['theme']),
-        'ingame_mode': str(payload.get('ingame_mode', s['ingame_mode'])).strip().lower(),
-        'invert_bg': 1 if _to_bool(payload.get('invert_bg', s.get('invert_bg', False))) else 0,
-    })
-    
-    try:
-        dbmod.set_settings(s)
-        global _SETTINGS_LOADED
-        _SETTINGS_LOADED = False
-        _load_settings(force=True)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-    
-    return {"ok": True}
-
-
-def signal_lobby_ready(login: Optional[str]) -> Dict[str, Any]:
-    """Сигнал о готовности лобби."""
-    count = 0
-    for b in _BOTS:
-        try:
-            if login and (b.account or {}).get('login', '').strip().lower() != login.strip().lower():
-                continue
-            if hasattr(b, 'signal_lobby_ready'):
-                b.signal_lobby_ready()
-                count += 1
-        except Exception:
-            pass
-    return {"ok": True, "signaled": count}
-
-
-def get_accounts() -> Dict[str, Any]:
-    """Получение списка аккаунтов."""
-    try:
-        accs = dbmod.fetch_accounts()
-        return {"ok": True, "accounts": accs}
-    except Exception as e:
-        _status_sys("system", f"accounts load error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def save_accounts(payload: Dict) -> Dict[str, Any]:
-    """Сохранение аккаунтов."""
-    items = payload.get('accounts') or []
-    try:
-        n = dbmod.upsert_accounts(items)
-        _status_sys("system", f"accounts saved: {n}")
-        return {"ok": True, "saved": n}
-    except Exception as e:
-        _status_sys("system", f"accounts save error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def get_proxies() -> Dict[str, Any]:
-    """Получение списка прокси."""
-    try:
-        px = dbmod.fetch_proxies()
-        return {"ok": True, "proxies": px}
-    except Exception as e:
-        _status_sys("system", f"proxies load error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def save_proxies(payload: Dict) -> Dict[str, Any]:
-    """Сохранение прокси."""
-    items = payload.get('proxies') or []
-    try:
-        n = dbmod.upsert_proxies(items)
-        _status_sys("system", f"proxies saved: {n}")
-        return {"ok": True, "saved": n}
-    except Exception as e:
-        _status_sys("system", f"proxies save error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-# === Новые команды: Метрики и статистика ===
-def get_metrics(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Получение метрик всех ботов."""
-    login = (params or {}).get('login')
-    
-    if login:
-        if login in _METRICS:
-            return {"ok": True, "metrics": _METRICS[login].to_dict()}
-        return {"ok": False, "error": "Bot not found"}
-    
-    return {
-        "ok": True,
-        "metrics": {k: v.to_dict() for k, v in _METRICS.items()},
-        "server_uptime": time.time() - _START_TIME,
-        "active_bots": len([t for t in _THREADS.values() if t.is_alive()]),
-        "total_bots": len(_BOTS),
-    }
-
-
-def get_bot_state(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Получение детального состояния бота."""
-    login = (params or {}).get('login')
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    login = login.strip().lower()
-    
-    # Найти бота
-    bot = None
-    for b in _BOTS:
-        if (b.account or {}).get('login', '').strip().lower() == login:
-            bot = b
-            break
-    
-    if not bot:
-        return {"ok": False, "error": "Bot not found"}
-    
-    # Собрать состояние
-    thread = _THREADS.get(login)
-    metrics = _METRICS.get(login)
-    
-    return {
-        "ok": True,
-        "state": {
-            "login": login,
-            "running": thread.is_alive() if thread else False,
-            "stop_requested": bot.stop_requested,
-            "status": _STATUS.get(login, {}).get("status", "unknown"),
-            "metrics": metrics.to_dict() if metrics else None,
-            "has_browser": bot.browser is not None,
-            "manual_lobby_flag": bot.manual_lobby_event.is_set(),
-        }
-    }
-
-
-def reset_metrics(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Сброс метрик."""
-    login = (params or {}).get('login')
-    
-    if login:
-        if login in _METRICS:
-            _METRICS[login] = BotMetrics(login=login)
-            return {"ok": True, "reset": login}
-        return {"ok": False, "error": "Bot not found"}
-    
-    _METRICS.clear()
-    return {"ok": True, "reset": "all"}
-
-
-# === Новые команды: Vision/YOLO ===
-def detect_screen_state_cmd(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Определение состояния экрана через vision.
-    
-    Params:
-        login: str - логин бота (для получения его страницы)
-        use_yolo: bool - использовать YOLO детекцию
-    """
-    login = (params or {}).get('login')
-    use_yolo = _to_bool((params or {}).get('use_yolo', False))
-    
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    # Найти бота и его страницу
-    bot = None
-    for b in _BOTS:
-        if (b.account or {}).get('login', '').strip().lower() == login.strip().lower():
-            bot = b
-            break
-    
-    if not bot:
-        return {"ok": False, "error": "Bot not found"}
-    
-    # Попробовать получить страницу из бота
-    page = getattr(bot, 'page', None)
-    if not page:
-        return {"ok": False, "error": "No page available"}
-    
-    try:
-        from ..vision import detect_screen_state, capture_page_bgr
-        
-        # Захват экрана
-        image = capture_page_bgr(page)
-        if image is None:
-            return {"ok": False, "error": "Failed to capture screen"}
-        
-        # Детекция состояния
-        state = detect_screen_state(image)
-        
-        result = {
-            "ok": True,
-            "state": state.value if hasattr(state, 'value') else str(state),
-        }
-        
-        # YOLO детекция если запрошена
-        if use_yolo:
-            try:
-                from ..vision.yolo_detector import yolo_detect_game_state
-                yolo_state = yolo_detect_game_state(image)
-                result["yolo_state"] = yolo_state
-            except Exception as e:
-                result["yolo_error"] = str(e)
-        
-        # Обновить метрики
-        _update_metrics(login, 
-            detections_count=_METRICS.get(login, BotMetrics(login=login)).detections_count + 1,
-            last_detection_time=time.time()
-        )
-        
-        return result
-        
-    except Exception as e:
-        _send_error(login, f"Detection error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def run_yolo_detection(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Запуск YOLO детекции на текущем экране бота.
-    
-    Params:
-        login: str - логин бота
-        classes: list[str] - классы для детекции (опционально)
-        confidence: float - минимальная уверенность (0.0-1.0)
-    """
-    login = (params or {}).get('login')
-    classes = (params or {}).get('classes', [])
-    confidence = _to_float((params or {}).get('confidence', 0.5), 0.5)
-    
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    # Найти бота
-    bot = None
-    for b in _BOTS:
-        if (b.account or {}).get('login', '').strip().lower() == login.strip().lower():
-            bot = b
-            break
-    
-    if not bot:
-        return {"ok": False, "error": "Bot not found"}
-    
-    page = getattr(bot, 'page', None)
-    if not page:
-        return {"ok": False, "error": "No page available"}
-    
-    try:
-        from ..vision import capture_page_bgr
-        from ..vision.yolo_detector import yolo_detect, yolo_detect_ui_elements
-        
-        image = capture_page_bgr(page)
-        if image is None:
-            return {"ok": False, "error": "Failed to capture screen"}
-        
-        # Детекция
-        if classes:
-            detections = yolo_detect(image, classes=classes, conf=confidence)
-        else:
-            detections = yolo_detect_ui_elements(image, conf=confidence)
-        
-        # Отправка события
-        _send_typed_event(EventType.DETECTION, login=login, detections=detections)
-        
-        return {
-            "ok": True,
-            "detections": detections,
-            "count": len(detections),
-        }
-        
-    except Exception as e:
-        _send_error(login, f"YOLO error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-# === Новые команды: Canvas навигация ===
-def canvas_press_button(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Нажатие кнопки геймпада через canvas navigator.
-    
-    Params:
-        login: str - логин бота
-        button: str - кнопка (A, B, X, Y, DPAD_UP, etc.)
-        hold_time: float - время удержания
-    """
-    login = (params or {}).get('login')
-    button = (params or {}).get('button', 'A')
-    hold_time = _to_float((params or {}).get('hold_time', 0.1), 0.1)
-    
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    # Найти бота
-    bot = None
-    for b in _BOTS:
-        if (b.account or {}).get('login', '').strip().lower() == login.strip().lower():
-            bot = b
-            break
-    
-    if not bot:
-        return {"ok": False, "error": "Bot not found"}
-    
-    page = getattr(bot, 'page', None)
-    if not page:
-        return {"ok": False, "error": "No page available"}
-    
-    try:
-        from ..bot.canvas import CanvasNavigator, GamepadButton
-        
-        # Получить или создать navigator
-        navigator = getattr(bot, '_canvas_navigator', None)
-        if not navigator:
-            navigator = CanvasNavigator(page)
-            bot._canvas_navigator = navigator
-        
-        # Найти кнопку
-        try:
-            btn = GamepadButton[button.upper()]
-        except KeyError:
-            return {"ok": False, "error": f"Unknown button: {button}"}
-        
-        # Нажать
-        asyncio.get_event_loop().run_until_complete(
-            navigator.press_button(btn, hold_time=hold_time)
-        )
-        
-        return {"ok": True, "button": button}
-        
-    except Exception as e:
-        _send_error(login, f"Canvas button error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def canvas_navigate(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Навигация в canvas.
-    
-    Params:
-        login: str - логин бота
-        direction: str - направление (UP, DOWN, LEFT, RIGHT)
-        count: int - количество нажатий
-    """
-    login = (params or {}).get('login')
-    direction = (params or {}).get('direction', 'DOWN')
-    count = _to_int((params or {}).get('count', 1), 1)
-    
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    bot = None
-    for b in _BOTS:
-        if (b.account or {}).get('login', '').strip().lower() == login.strip().lower():
-            bot = b
-            break
-    
-    if not bot:
-        return {"ok": False, "error": "Bot not found"}
-    
-    page = getattr(bot, 'page', None)
-    if not page:
-        return {"ok": False, "error": "No page available"}
-    
-    try:
-        from ..bot.canvas import CanvasNavigator, NavigationDirection
-        
-        navigator = getattr(bot, '_canvas_navigator', None)
-        if not navigator:
-            navigator = CanvasNavigator(page)
-            bot._canvas_navigator = navigator
-        
-        try:
-            nav_dir = NavigationDirection[direction.upper()]
-        except KeyError:
-            return {"ok": False, "error": f"Unknown direction: {direction}"}
-        
-        asyncio.get_event_loop().run_until_complete(
-            navigator.navigate(nav_dir, count=count)
-        )
-        
-        return {"ok": True, "direction": direction, "count": count}
-        
-    except Exception as e:
-        _send_error(login, f"Canvas navigate error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def canvas_get_screen_state(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Получение состояния экрана через canvas navigator.
-    
-    Params:
-        login: str - логин бота
-    """
-    login = (params or {}).get('login')
-    
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    bot = None
-    for b in _BOTS:
-        if (b.account or {}).get('login', '').strip().lower() == login.strip().lower():
-            bot = b
-            break
-    
-    if not bot:
-        return {"ok": False, "error": "Bot not found"}
-    
-    page = getattr(bot, 'page', None)
-    if not page:
-        return {"ok": False, "error": "No page available"}
-    
-    try:
-        from ..bot.canvas import CanvasNavigator
-        
-        navigator = getattr(bot, '_canvas_navigator', None)
-        if not navigator:
-            navigator = CanvasNavigator(page)
-            bot._canvas_navigator = navigator
-        
-        state = asyncio.get_event_loop().run_until_complete(
-            navigator.detect_screen_state()
-        )
-        
-        # Отправить событие
-        _send_typed_event(EventType.SCREEN_STATE, login=login, state=state.value)
-        
-        return {
-            "ok": True,
-            "state": state.value,
-            "state_name": state.name,
-        }
-        
-    except Exception as e:
-        _send_error(login, f"Canvas state error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-# === Новые команды: Управление отдельным ботом ===
-def start_one_bot(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Запуск одного конкретного бота по логину."""
-    login = (params or {}).get('login')
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    _load_settings()
-    
-    try:
-        accounts = dbmod.fetch_accounts()
-        account = None
-        for acc in accounts:
-            if (acc.get('login') or '').strip().lower() == login.strip().lower():
-                account = acc
-                break
-        
-        if not account:
-            return {"ok": False, "error": "Account not found"}
-        
-        # Найти прокси
-        proxies = dbmod.fetch_proxies()
-        bindings = {}
-        for b in dbmod.fetch_proxy_bindings():
-            bindings[b['login'].strip().lower()] = f"{b['host']}:{b['port']}"
-        
-        proxy = None
-        key = bindings.get(login.strip().lower())
-        if key:
-            for p in proxies:
-                if f"{p['host']}:{p['port']}" == key:
-                    proxy = p
-                    break
-        
-        # Запустить бота
-        _start_single_bot(account, proxy)
-        
-        return {"ok": True, "started": login}
-        
-    except Exception as e:
-        _send_error("system", f"Start bot error: {e}")
-        return {"ok": False, "error": str(e)}
-
-
-def stop_one_bot(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Остановка одного конкретного бота."""
-    login = (params or {}).get('login')
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    login = login.strip().lower()
-    
-    # Найти и остановить бота
-    stopped = False
-    for b in list(_BOTS):
-        if (b.account or {}).get('login', '').strip().lower() == login:
-            b.request_stop()
-            stopped = True
-    
-    # Дождаться потока
-    th = _THREADS.get(login)
-    if th and th.is_alive():
-        th.join(timeout=10)
-    _THREADS.pop(login, None)
-    
-    if stopped:
-        _status_sys(login, "Остановлен")
-        return {"ok": True, "stopped": login}
-    
-    return {"ok": False, "error": "Bot not found or not running"}
-
-
-def restart_bot(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Перезапуск бота."""
-    login = (params or {}).get('login')
-    if not login:
-        return {"ok": False, "error": "login required"}
-    
-    # Остановить
-    stop_result = stop_one_bot(params)
-    if not stop_result.get('ok'):
-        # Бота может не быть запущенным, это нормально
-        pass
-    
-    # Небольшая пауза
-    time.sleep(1)
-    
-    # Запустить
-    return start_one_bot(params)
-
-
-# === Вспомогательные функции ===
-def _start_single_bot(account: Dict, proxy: Optional[Dict]):
-    """Запуск одного бота."""
-    login = (account.get('login') or '').strip().lower()
-    old = _THREADS.get(login)
-    
-    # Проверка на уже запущенный поток
-    if old and old.is_alive():
-        _status_sys(login, "Уже запущен — пропускаю повторный старт")
-        return
-    
-    # Остановка старого бота
-    try:
-        for b in list(_BOTS):
-            if (b.account or {}).get('login', '').strip().lower() == login:
-                b.request_stop()
-        if old and old.is_alive():
-            old.join(timeout=10)
-    except Exception:
-        pass
-    
-    # Создание метрик
-    _METRICS[login] = BotMetrics(login=login, started_at=time.time())
-    
-    # Создание и запуск нового бота
-    bot = BotLogic(account, proxy, _SETTINGS, _update_status)
-    _BOTS.append(bot)
-    _status_sys(login, "Запуск...")
-    
-    def run_in_loop():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(bot.run())
-        except Exception as e:
-            _send_error(login, f"Bot error: {e}", str(e))
-        finally:
-            loop.close()
-            # Обновить метрики
-            if login in _METRICS:
-                _METRICS[login].current_state = "stopped"
-    
-    th = threading.Thread(target=run_in_loop, daemon=True)
-    th.start()
-    _THREADS[login] = th
-
-
-# === Команды системы ===
-def get_server_info() -> Dict[str, Any]:
-    """Информация о сервере."""
-    return {
-        "ok": True,
-        "info": {
-            "uptime": time.time() - _START_TIME,
-            "started_at": _START_TIME,
-            "bots_count": len(_BOTS),
-            "active_threads": len([t for t in _THREADS.values() if t.is_alive()]),
-            "settings_loaded": _SETTINGS_LOADED,
-            "python_version": sys.version,
-            "parallel_pool_active": _PARALLEL_POOL is not None,
-        }
-    }
-
-
-def ping() -> Dict[str, Any]:
-    """Проверка связи."""
-    return {"ok": True, "pong": time.time()}
-
-
-def get_logs(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Получение последних логов."""
-    login = (params or {}).get('login')
-    limit = _to_int((params or {}).get('limit', 100), 100)
-    
-    # Возвращаем статусы как "логи"
-    if login:
-        status = _STATUS.get(login.strip().lower())
-        return {"ok": True, "logs": [status] if status else []}
-    
-    # Все статусы
-    logs = sorted(_STATUS.items(), key=lambda x: x[1].get('ts', 0), reverse=True)[:limit]
-    return {"ok": True, "logs": [{"login": k, **v} for k, v in logs]}
-
-
-# === Команды параллельного запуска ===
-_PARALLEL_POOL: Optional['BotWorkerPool'] = None
-
-
-def start_parallel(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """
-    Запуск ботов через параллельный пул.
-    
-    Params:
-        max_workers: int - макс. одновременных ботов (по умолчанию 5)
-        logins: list[str] - список логинов для запуска (опционально, все если не указано)
-        priority: str - приоритет (high, normal, low)
-    """
-    global _PARALLEL_POOL
-    
-    _load_settings()
-    
-    max_workers = _to_int((params or {}).get('max_workers', 5), 5)
-    target_logins = (params or {}).get('logins', [])
-    priority_str = (params or {}).get('priority', 'normal').lower()
-    
-    try:
-        from ..bot.parallel import BotWorkerPool, BotPriority
-        
-        # Определяем приоритет
-        priority_map = {
-            'high': BotPriority.HIGH,
-            'normal': BotPriority.NORMAL,
-            'low': BotPriority.LOW,
-        }
-        priority = priority_map.get(priority_str, BotPriority.NORMAL)
-        
-        # Загружаем аккаунты
-        accounts = dbmod.fetch_accounts()
-        
-        if target_logins:
-            target_logins_lower = [l.lower() for l in target_logins]
-            accounts = [a for a in accounts if a.get('login', '').lower() in target_logins_lower]
-        
-        if not accounts:
-            return {"ok": False, "error": "Нет аккаунтов для запуска"}
-        
-        # Загружаем прокси
-        proxies = dbmod.fetch_proxies()
-        bindings = {}
-        for b in dbmod.fetch_proxy_bindings():
-            bindings[b['login'].strip().lower()] = f"{b['host']}:{b['port']}"
-        
-        proxies_by_key = {f"{p['host']}:{p['port']}": p for p in proxies}
-        
-        # Создаём или перезапускаем пул
-        if _PARALLEL_POOL:
-            _PARALLEL_POOL.stop(wait=False)
-        
-        _PARALLEL_POOL = BotWorkerPool(
-            max_workers=max_workers,
-            settings=_SETTINGS,
-            status_callback=_update_status,
-        )
-        _PARALLEL_POOL.start()
-        
-        # Добавляем ботов
-        for account in accounts:
-            login = account.get('login', '').strip().lower()
-            
-            # Находим прокси
-            proxy = None
-            key = bindings.get(login)
-            if key and key in proxies_by_key:
-                proxy = proxies_by_key[key]
-            
-            _PARALLEL_POOL.submit(
-                account=account,
-                proxy=proxy,
-                priority=priority,
-                headless=_SETTINGS.get('headless', True),
+    def _ensure_orchestrator(self) -> SessionOrchestrator:
+        """Lazy-ініціалізація оркестратора."""
+        if self._orchestrator is None:
+            config = EmulatorConfig.load()
+            self._orchestrator = SessionOrchestrator(
+                config=config,
+                status_callback=self._on_status,
             )
-        
-        _status_sys("system", f"Параллельный запуск: {len(accounts)} ботов, max_workers={max_workers}")
-        
-        return {
-            "ok": True,
-            "started": len(accounts),
-            "max_workers": max_workers,
-            "logins": [a.get('login') for a in accounts],
-        }
-        
-    except Exception as e:
-        logger.error(f"Parallel start error: {e}", exc_info=True)
-        return {"ok": False, "error": str(e)}
+        return self._orchestrator
 
+    def _on_status(self, message: str) -> None:
+        """Колбек статусу від оркестратора → event у GUI."""
+        self._send_event("status", {"message": message, "ts": time.time()})
 
-def stop_parallel() -> Dict[str, Any]:
-    """Остановка параллельного пула."""
-    global _PARALLEL_POOL
-    
-    if not _PARALLEL_POOL:
-        return {"ok": False, "error": "Пул не запущен"}
-    
-    try:
-        _PARALLEL_POOL.cancel_all()
-        _PARALLEL_POOL.stop(wait=True, timeout=30)
-        _PARALLEL_POOL = None
-        
-        _status_sys("system", "Параллельный пул остановлен")
-        return {"ok": True}
-        
-    except Exception as e:
-        logger.error(f"Parallel stop error: {e}", exc_info=True)
-        return {"ok": False, "error": str(e)}
+    def _send_event(self, event_type: str, data: Any = None) -> None:
+        """Відправляє notification (event) у stdout."""
+        msg = _notification(f"event.{event_type}", data)
+        self._write(msg)
 
+    # ========================================================================
+    # I/O
+    # ========================================================================
 
-def get_parallel_stats() -> Dict[str, Any]:
-    """Получение статистики параллельного пула."""
-    if not _PARALLEL_POOL:
-        return {"ok": False, "error": "Пул не запущен"}
-    
-    try:
-        stats = _PARALLEL_POOL.get_stats()
-        statuses = _PARALLEL_POOL.get_all_statuses()
-        
-        return {
-            "ok": True,
-            "stats": {
-                "total_tasks": stats.total_tasks,
-                "completed_tasks": stats.completed_tasks,
-                "failed_tasks": stats.failed_tasks,
-                "active_workers": stats.active_workers,
-                "queued_tasks": stats.queued_tasks,
-                "average_duration": stats.average_duration,
-                "total_retries": stats.total_retries,
-                "started_at": stats.started_at,
-            },
-            "statuses": {k: v.value for k, v in statuses.items()},
-        }
-        
-    except Exception as e:
-        logger.error(f"Parallel stats error: {e}", exc_info=True)
-        return {"ok": False, "error": str(e)}
-
-
-def set_parallel_workers(params: Optional[Dict] = None) -> Dict[str, Any]:
-    """Изменение количества воркеров."""
-    if not _PARALLEL_POOL:
-        return {"ok": False, "error": "Пул не запущен"}
-    
-    max_workers = _to_int((params or {}).get('max_workers', 5), 5)
-    
-    try:
-        # Изменение требует перезапуска пула
-        _PARALLEL_POOL.max_workers = max_workers
-        
-        return {"ok": True, "max_workers": max_workers}
-        
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-# === Роутинг методов ===
-_METHODS: Dict[str, Callable] = {
-    # Основные
-    "start": lambda params: start_all(),
-    "stop": lambda params: stop_all(),
-    "get_status": lambda params: get_status(),
-    "get_settings": lambda params: get_settings(),
-    "save_settings": lambda params: save_settings(params or {}),
-    "signal_lobby_ready": lambda params: signal_lobby_ready((params or {}).get('login')),
-    "get_accounts": lambda params: get_accounts(),
-    "save_accounts": lambda params: save_accounts(params or {}),
-    "get_proxies": lambda params: get_proxies(),
-    "save_proxies": lambda params: save_proxies(params or {}),
-    
-    # Метрики
-    "get_metrics": lambda params: get_metrics(params),
-    "get_bot_state": lambda params: get_bot_state(params),
-    "reset_metrics": lambda params: reset_metrics(params),
-    
-    # Vision/YOLO
-    "detect_screen_state": lambda params: detect_screen_state_cmd(params),
-    "run_yolo_detection": lambda params: run_yolo_detection(params),
-    
-    # Canvas
-    "canvas_press_button": lambda params: canvas_press_button(params),
-    "canvas_navigate": lambda params: canvas_navigate(params),
-    "canvas_get_screen_state": lambda params: canvas_get_screen_state(params),
-    
-    # Управление одним ботом
-    "start_one": lambda params: start_one_bot(params),
-    "stop_one": lambda params: stop_one_bot(params),
-    "restart_bot": lambda params: restart_bot(params),
-    
-    # Параллельный запуск
-    "start_parallel": lambda params: start_parallel(params),
-    "stop_parallel": lambda params: stop_parallel(),
-    "get_parallel_stats": lambda params: get_parallel_stats(),
-    "set_parallel_workers": lambda params: set_parallel_workers(params),
-    
-    # Система
-    "get_server_info": lambda params: get_server_info(),
-    "ping": lambda params: ping(),
-    "get_logs": lambda params: get_logs(params),
-}
-
-
-def handle_command(req: Dict) -> Dict[str, Any]:
-    """Обработка одной команды."""
-    method_name = req.get('method')
-    method = _METHODS.get(method_name)
-    
-    if not method:
-        logger.warning(f"Unknown method: {method_name}")
-        return {"id": req.get('id'), "error": "method_not_found", "method": method_name}
-    
-    try:
-        start_time = time.time()
-        result = method(req.get('params'))
-        elapsed = time.time() - start_time
-        
-        # Логируем медленные команды
-        if elapsed > 1.0:
-            logger.warning(f"Slow command {method_name}: {elapsed:.2f}s")
-        
-        return {"id": req.get('id'), "result": result}
-    except Exception as e:
-        logger.error(f"Error in {method_name}: {e}", exc_info=True)
-        return {"id": req.get('id'), "error": str(e), "traceback": traceback.format_exc()}
-
-
-def main():
-    """Главный цикл IPC сервера."""
-    # Инициализация БД
-    try:
-        dbmod.init_db()
-    except Exception as e:
-        _status_sys("system", f"DB init warning: {e}")
-    
-    _load_settings()
-    _status_sys("system", "IPC server ready")
-    logger.info("IPC server started")
-    
-    # Обработка команд из stdin
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        
+    def _write(self, msg: Dict) -> None:
+        """Записує JSON у stdout (thread-safe). Використовує клонований fd."""
         try:
-            req = json.loads(line)
-            resp = handle_command(req)
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {line[:100]}")
-            resp = {"id": None, "error": f"Invalid JSON: {e}"}
+            line = json.dumps(msg, ensure_ascii=False, default=str)
+            _IPC_STDOUT.write(line + "\n")
+            _IPC_STDOUT.flush()
         except Exception as e:
-            logger.error(f"Error handling command: {e}", exc_info=True)
-            resp = {"id": None, "error": str(e)}
-        
+            logger.error(f"IPC write error: {e}")
+
+    def run(self) -> None:
+        """Головний цикл: читаємо stdin, обробляємо, пишемо stdout."""
+        self._running = True
+        logger.info("IPC Server started (stdin/stdout JSON-RPC)")
+        self._send_event("ready", {"version": "4.0.0"})
+
+        for line in _IPC_STDIN:
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError:
+                self._write(_error(PARSE_ERROR, "Invalid JSON"))
+                continue
+
+            response = self._handle(request)
+            if response is not None:
+                self._write(response)
+
+        self._running = False
+        logger.info("IPC Server stopped")
+
+    def _handle(self, request: Dict) -> Optional[Dict]:
+        """Обробляє один JSON-RPC запит."""
+        req_id = request.get("id")
+        method = request.get("method")
+        params = request.get("params", {})
+
+        if not method:
+            return _error(INVALID_REQUEST, "Missing 'method'", req_id)
+
+        handler = self._methods.get(method)
+        if not handler:
+            return _error(METHOD_NOT_FOUND, f"Unknown method: {method}", req_id)
+
         try:
-            sys.stdout.write(json.dumps(resp) + "\n")
-            sys.stdout.flush()
+            if isinstance(params, dict):
+                result = handler(**params)
+            elif isinstance(params, list):
+                result = handler(*params)
+            else:
+                result = handler()
+            return _ok(result, req_id)
+        except TypeError as e:
+            return _error(INVALID_PARAMS, str(e), req_id)
+        except EmulatorError as e:
+            return _error(APP_ERROR, str(e), req_id)
         except Exception as e:
-            logger.error(f"Error writing response: {e}")
+            logger.exception(f"IPC handler error: {method}")
+            return _error(INTERNAL_ERROR, str(e), req_id)
+
+    # ========================================================================
+    # COMMANDS — Global
+    # ========================================================================
+
+    def _cmd_ping(self) -> str:
+        return "pong"
+
+    def _cmd_get_version(self) -> Dict:
+        from .. import __version__
+        return {"version": __version__, "mode": "emulator"}
+
+    def _cmd_get_status(self) -> Dict:
+        orch = self._ensure_orchestrator()
+        status = orch.get_status()
+        status["accounts_in_db"] = get_account_count()
+        return status
+
+    # ========================================================================
+    # COMMANDS — Accounts
+    # ========================================================================
+
+    def _cmd_get_accounts(self) -> List[Dict]:
+        return fetch_accounts()
+
+    def _cmd_add_account(self, login: str, password: str) -> Dict:
+        ok = add_account(login, password)
+        return {"success": ok, "login": login}
+
+    def _cmd_delete_account(self, login: str) -> Dict:
+        ok = delete_account(login)
+        return {"success": ok, "login": login}
+
+    def _cmd_import_accounts(self, text: str) -> Dict:
+        """Масовий імпорт: кожен рядок — email:password або email|password."""
+        accounts = []
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            sep = ":" if ":" in line else "|"
+            parts = line.split(sep, 1)
+            if len(parts) == 2:
+                accounts.append({
+                    "login": parts[0].strip(),
+                    "password": parts[1].strip(),
+                })
+        imported = upsert_accounts(accounts) if accounts else 0
+        return {"imported": imported, "total_lines": len(text.strip().splitlines())}
+
+    # ========================================================================
+    # COMMANDS — Instances
+    # ========================================================================
+
+    def _cmd_list_instances(self) -> List[Dict]:
+        orch = self._ensure_orchestrator()
+        instances = orch.ldplayer.list_instances()
+        result = []
+        for inst in instances:
+            d = inst.to_dict()
+            # Додаємо стан фарму
+            session = orch._active_sessions.get(inst.name)
+            d["farm_state"] = session.state.value if session else "idle"
+            result.append(d)
+        return result
+
+    def _cmd_setup_instance(self, name: str) -> Dict:
+        orch = self._ensure_orchestrator()
+        instance = orch.setup_instance(name)
+        return instance.to_dict()
+
+    def _cmd_clone_instance(self, source: str, new_name: str) -> Dict:
+        orch = self._ensure_orchestrator()
+        clone = orch.clone_and_setup(source, new_name)
+        return clone.to_dict()
+
+    def _cmd_remove_instance(self, name: str) -> Dict:
+        orch = self._ensure_orchestrator()
+        # Спочатку зупиняємо фарм якщо є
+        orch.stop_instance(name)
+        # Видаляємо інстанс
+        instance = orch.ldplayer.get_instance(name)
+        if instance:
+            orch.ldplayer.remove_instance(instance)
+            return {"success": True, "name": name}
+        return {"success": False, "error": f"Instance not found: {name}"}
+
+    # ========================================================================
+    # COMMANDS — Farm
+    # ========================================================================
+
+    def _cmd_start_farm(self, instance_name: str, email: str) -> Dict:
+        orch = self._ensure_orchestrator()
+        # Знаходимо акаунт
+        accounts = orch.account_storage.get_all_accounts()
+        account = next((a for a in accounts if a.ms_email == email), None)
+        if not account:
+            # Створюємо мінімальний AccountData
+            db_accounts = fetch_accounts()
+            db_acct = next((a for a in db_accounts if a["login"] == email), None)
+            if not db_acct:
+                return {"success": False, "error": f"Account not found: {email}"}
+            account = AccountData(
+                ms_email=db_acct["login"],
+                ms_password=db_acct.get("password", ""),
+            )
+            orch.account_storage.add_account(account)
+
+        orch.start_farming(instance_name, account, in_background=True)
+        return {"success": True, "instance": instance_name, "account": email}
+
+    def _cmd_stop_farm(self, instance_name: str) -> Dict:
+        orch = self._ensure_orchestrator()
+        orch.stop_instance(instance_name)
+        return {"success": True, "instance": instance_name}
+
+    def _cmd_stop_all(self) -> Dict:
+        orch = self._ensure_orchestrator()
+        orch.stop_all()
+        return {"success": True}
+
+    def _cmd_shutdown_all(self) -> Dict:
+        orch = self._ensure_orchestrator()
+        orch.shutdown_everything()
+        return {"success": True}
+
+    # ========================================================================
+    # COMMANDS — Settings
+    # ========================================================================
+
+    def _cmd_get_settings(self) -> Dict:
+        return get_settings()
+
+    def _cmd_set_settings(self, settings: Dict) -> Dict:
+        count = set_settings(settings)
+        return {"success": True, "updated": count}
+
+    def _cmd_get_emulator_config(self) -> Dict:
+        orch = self._ensure_orchestrator()
+        return orch.config.to_dict()
+
+    def _cmd_set_emulator_config(self, config_data: Dict) -> Dict:
+        orch = self._ensure_orchestrator()
+        new_config = EmulatorConfig.from_dict(config_data)
+        orch._config = new_config
+        new_config.save()
+        return {"success": True}
+
+    # ========================================================================
+    # COMMANDS — Logs
+    # ========================================================================
+
+    def _cmd_get_recent_logs(self, count: int = 100) -> List[str]:
+        """Повертає останні N рядків лог-файлу."""
+        log_file = os.path.join(LOGS_DIR, "epicbot.log")
+        if not os.path.exists(log_file):
+            return []
+        try:
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            return [l.rstrip() for l in lines[-count:]]
+        except Exception:
+            return []
 
 
-if __name__ == '__main__':
-    main()
+# ============================================================================
+# PUBLIC API
+# ============================================================================
+
+def handle_command(request: Dict) -> Optional[Dict]:
+    """Обробляє одну JSON-RPC команду (для тестування)."""
+    server = IPCServer()
+    return server._handle(request)
+
+
+def main() -> None:
+    """Точка входу IPC сервера."""
+    import logging as _logging
+
+    # !! КРИТИЧНО: stdout зайнятий JSON-RPC, тому ВСЕ логування → stderr + файл
+    # Скидаємо флаг ініціалізації щоб setup_logging працювало без console
+    from ..core import logger as _logmod
+    _logmod._initialized = False
+    _logmod._root_logger = None
+
+    setup_logging(log_to_console=False, log_to_file=True)
+
+    # Додаємо stderr-хендлер (замість stdout)
+    root = _logging.getLogger('epicbot')
+    stderr_handler = _logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(_logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    stderr_handler.setLevel(_logging.INFO)
+    root.addHandler(stderr_handler)
+
+    init_db()
+    logger.info("Starting IPC Server...")
+    server = IPCServer()
+    server.run()

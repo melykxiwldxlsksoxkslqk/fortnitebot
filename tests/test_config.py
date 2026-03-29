@@ -11,10 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.config import (
     TIMEOUTS,
-    VISION,
-    RL,
-    BROWSER,
-    ASSETS,
+    EMULATOR,
     DEFAULT_SETTINGS,
     validate_island_code,
     validate_email,
@@ -28,36 +25,17 @@ class TestConfig:
         """Тест значений таймаутов."""
         assert TIMEOUTS.page_load > 0
         assert TIMEOUTS.element_wait > 0
-        assert TIMEOUTS.episode_max_duration > 0
     
-    def test_vision_values(self):
-        """Тест значений для vision."""
-        assert 0 < VISION.default_confidence <= 1.0
-        assert VISION.observation_width > 0
-        assert VISION.observation_height > 0
-        assert len(VISION.pyramid_scales) > 0
-    
-    def test_rl_values(self):
-        """Тест значений для RL."""
-        assert RL.num_actions == 12
-        assert RL.base_step_penalty < 0
-        assert RL.attack_with_target_reward > 0
-    
-    def test_browser_config(self):
-        """Тест конфигурации браузера."""
-        assert "xbox.com" in BROWSER.xbox_cloud_url
-        assert BROWSER.navigation_timeout > 0
-    
-    def test_assets_required(self):
-        """Тест списка обязательных ассетов."""
-        required = ASSETS.get_required()
-        assert len(required) >= 4
-        assert all('.png' in asset for asset in required)
+    def test_emulator_config(self):
+        """Тест конфигурации эмулятора."""
+        assert "xbox.com" in EMULATOR.xbox_cloud_url
+        assert EMULATOR.max_instances > 0
+        assert EMULATOR.adb_timeout > 0
     
     def test_default_settings(self):
         """Тест значений по умолчанию."""
         assert 'island_code' in DEFAULT_SETTINGS
-        assert 'headless' in DEFAULT_SETTINGS
+        assert 'log_level' in DEFAULT_SETTINGS
         assert isinstance(DEFAULT_SETTINGS['time_on_island_min'], int)
 
 
